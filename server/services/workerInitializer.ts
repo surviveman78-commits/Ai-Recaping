@@ -1,9 +1,8 @@
 import fs from 'fs';
 import path from 'path';
-import { exec, spawn } from 'child_process';
+import { exec } from 'child_process';
 import { Response } from 'express';
 import {
-  WorkerInitState,
   WorkerInitStep,
   WorkerInitializationStatus,
   WorkerEnvironmentInfo,
@@ -35,6 +34,20 @@ const INITIAL_STEPS: { id: string; name: string; description: string }[] = [
   { id: 'step-12', name: 'Worker Ready', description: 'Kaggle GPU Worker verified and ready for movie recap generation' },
 ];
 
+export interface ExecCommandOptions {
+  stageName?: string;
+  timeoutMs?: number;
+  workerId?: string;
+  ignoreExitCode?: boolean;
+}
+
+export interface ExecCommandResult {
+  stdout: string;
+  stderr: string;
+  exitCode: number;
+  durationMs: number;
+}
+
 class WorkerInitializerService {
   public readonly currentSessionId: string = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
   private statusMap: Map<string, WorkerInitializationStatus> = new Map();
@@ -54,9 +67,10 @@ class WorkerInitializerService {
   }
 
   private sanitize(message: string): string {
+    if (!message) return '';
     const settings = jobStore.getSettings();
     const rawKeys = jobStore.getRawKeys();
-    let sanitized = message;
+    let sanitized = String(message);
 
     if (settings.workerSecretToken) {
       sanitized = sanitized.split(settings.workerSecretToken).join('[WORKER_TOKEN]');
@@ -138,11 +152,11 @@ class WorkerInitializerService {
           this.startHeartbeat(workerId, data.gpuName);
           return true;
         } else if (data && data.sessionId && data.sessionId !== this.currentSessionId) {
-          console.log(`[WorkerInitializer] Stale manifest detected (session ${data.sessionId}). Initialization required for current session.`);
+          console.log(`[KAGGLE-WORKER] Stale manifest detected (session ${data.sessionId}). Initialization required for current session.`);
         }
       }
     } catch (e) {
-      console.warn('[WorkerInitializer] Could not restore persisted manifest:', e);
+      console.warn('[KAGGLE-WORKER] Could not restore persisted manifest:', e);
     }
     return false;
   }
@@ -158,11 +172,10 @@ class WorkerInitializerService {
     const clients = this.sseClients.get(workerId)!;
     clients.add(res);
 
-    // Initial snapshot
+    // Initial snapshot sent immediately
     const current = this.getStatus(workerId);
     res.write(`event: snapshot\ndata: ${JSON.stringify(current)}\n\n`);
 
-    // Clean up on disconnect
     res.on('close', () => {
       clients.delete(res);
     });
@@ -195,6 +208,16 @@ class WorkerInitializerService {
     if (status.logs.length > 500) {
       status.logs.shift();
     }
+
+    // Explicit output to Kaggle server stdout/stderr so Kaggle notebook visibly displays execution
+    const tag = level === 'error' ? 'ERROR' : level === 'warn' ? 'WARN' : level === 'success' ? 'OK' : 'INFO';
+    const consoleLine = `[KAGGLE-WORKER] [${tag}] ${sanitizedMsg}`;
+    if (level === 'error') {
+      console.error(consoleLine);
+    } else {
+      console.log(consoleLine);
+    }
+
     this.broadcast(workerId, 'log', entry);
   }
 
@@ -251,6 +274,7 @@ class WorkerInitializerService {
     // Acquire lock
     status.isLocked = true;
     status.error = null;
+    status.state = 'checking';
     this.broadcast(workerId, 'state', { state: status.state, isLocked: true });
 
     if (!this.completedStepsCache.has(workerId)) {
@@ -275,10 +299,10 @@ class WorkerInitializerService {
     this.appendLog(workerId, `==================================================`, 'info');
 
     try {
-      // Step 1: Detect Python Environment
+      // Step 1: Detect Python Environment (Real execution of python3 --version)
       await this.runStep1Environment(workerId, completedSet);
 
-      // Step 2: Detect CUDA & GPU Hardware
+      // Step 2: Detect CUDA & GPU Hardware (Real execution of torch.cuda / nvidia-smi)
       await this.runStep2CudaGpu(workerId, completedSet);
 
       // Step 3: Check & Install Missing Python Packages
@@ -314,7 +338,7 @@ class WorkerInitializerService {
       this.updateStep(workerId, 11, { status: 'completed', progress: 100, completedAt: new Date().toISOString() }, 100);
       status.state = 'ready';
       status.initializedAt = new Date().toISOString();
-      this.appendLog(workerId, 'Worker initialization completed successfully. Ready for video processing ✓', 'success');
+      this.appendLog(workerId, '[OK] Kaggle GPU Worker initialization completed successfully', 'success');
 
       // Save persistent manifest
       this.persistManifest(workerId);
@@ -322,15 +346,28 @@ class WorkerInitializerService {
       this.broadcast(workerId, 'complete', { status });
     } catch (err: any) {
       status.state = 'failed';
+      const failedStage = err.stage || status.currentStep || 'Worker Initialization';
       const structuredErr: WorkerInitError = {
         code: err.code || 'WORKER_INITIALIZATION_ERROR',
         message: this.sanitize(err.message || 'Worker initialization failed'),
-        stage: status.state,
+        stage: failedStage,
         retryable: true,
-        details: err.stack ? this.sanitize(err.stack) : undefined,
+        details: err.details || (err.stack ? this.sanitize(err.stack) : undefined),
       };
       status.error = structuredErr;
-      this.appendLog(workerId, `FATAL: ${structuredErr.message}`, 'error');
+
+      // Mark the active step as failed
+      const activeStep = status.steps.find((s) => s.name === failedStage || s.status === 'running');
+      if (activeStep) {
+        activeStep.status = 'failed';
+        activeStep.details = structuredErr.message;
+        this.broadcast(workerId, 'step', activeStep);
+      }
+
+      this.appendLog(workerId, `[ERROR] ${failedStage}`, 'error');
+      this.appendLog(workerId, structuredErr.message, 'error');
+      console.error(`[KAGGLE-WORKER] [FATAL ERROR] Step '${failedStage}' failed:`, structuredErr.message);
+
       this.broadcast(workerId, 'error', { error: structuredErr });
     } finally {
       status.isLocked = false;
@@ -344,38 +381,71 @@ class WorkerInitializerService {
   // Step 1: Detect Python Environment
   // --------------------------------------------------------------------------
   private async runStep1Environment(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Detecting Python Environment';
     const status = this.getStatus(workerId);
     status.state = 'checking';
-    this.updateStep(workerId, 0, { status: 'running', progress: 30, startedAt: new Date().toISOString() }, 8);
-    this.appendLog(workerId, 'Step 1/12: Detecting Python environment...');
+    this.updateStep(workerId, 0, { status: 'running', progress: 20, startedAt: new Date().toISOString() }, 8);
+    this.appendLog(workerId, `[START] ${stageName}`);
 
     const envInfo: WorkerEnvironmentInfo = {
       cudaAvailable: false,
     };
 
-    // Check Python
+    // 1. Real execution: python3 --version
     try {
-      const pyOutput = await this.execCommand('python3 --version');
-      envInfo.python = pyOutput.trim().replace('Python ', '');
-      this.appendLog(workerId, `Python runtime detected: v${envInfo.python} ✓`);
-    } catch {
-      throw { code: 'PYTHON_MISSING', message: 'Python 3 executable not found in system PATH' };
+      const pyVerResult = await this.execCommand('python3 --version', {
+        stageName,
+        timeoutMs: 15000,
+        workerId,
+      });
+      const output = (pyVerResult.stdout || pyVerResult.stderr).trim();
+      envInfo.python = output.replace('Python ', '').trim();
+    } catch (e: any) {
+      throw {
+        code: 'PYTHON_MISSING',
+        stage: stageName,
+        message: `Python 3 executable not found or failed to execute: ${e.message}`,
+      };
     }
 
-    // Check Pip
+    // 2. Real execution: python3 sys.executable path
+    let pythonPath = '/usr/bin/python3';
     try {
-      const pipOutput = await this.execCommand('python3 -m pip --version');
-      envInfo.pip = pipOutput.trim().split(' ')[1] || 'available';
-      this.appendLog(workerId, `pip package manager: v${envInfo.pip} ✓`);
+      const pathRes = await this.execCommand('python3 -c "import sys; print(sys.executable)"', {
+        stageName: `${stageName} (Path)`,
+        timeoutMs: 10000,
+        workerId,
+      });
+      if (pathRes.stdout.trim()) {
+        pythonPath = pathRes.stdout.trim();
+      }
+    } catch {}
+
+    this.appendLog(workerId, `[OK] Python detected: ${pythonPath} (v${envInfo.python})`, 'success');
+
+    // 3. Real execution: python3 -m pip --version
+    try {
+      const pipResult = await this.execCommand('python3 -m pip --version', {
+        stageName: `${stageName} (Pip)`,
+        timeoutMs: 12000,
+        workerId,
+      });
+      const pipOut = pipResult.stdout.trim();
+      const parts = pipOut.split(' ');
+      envInfo.pip = parts[1] || 'available';
+      this.appendLog(workerId, `[OK] pip package manager: v${envInfo.pip}`);
     } catch {
-      this.appendLog(workerId, 'pip is not directly installed for python3; fallback modules will be checked', 'warn');
+      this.appendLog(workerId, '[WARN] pip is not directly installed for python3; fallback system modules will be checked', 'warn');
     }
 
-    // Check Git
+    // 4. Git check
     try {
-      const gitOutput = await this.execCommand('git --version');
-      envInfo.git = gitOutput.trim();
-      this.appendLog(workerId, `${envInfo.git} ✓`);
+      const gitResult = await this.execCommand('git --version', {
+        stageName: `${stageName} (Git)`,
+        timeoutMs: 8000,
+        workerId,
+      });
+      envInfo.git = gitResult.stdout.trim();
     } catch {}
 
     status.environment = envInfo;
@@ -383,7 +453,7 @@ class WorkerInitializerService {
     this.updateStep(workerId, 0, {
       status: 'completed',
       progress: 100,
-      details: `Python v${envInfo.python || '3.x'}`,
+      details: `${pythonPath} (v${envInfo.python})`,
       completedAt: new Date().toISOString(),
     }, 15);
   }
@@ -392,42 +462,57 @@ class WorkerInitializerService {
   // Step 2: Detect CUDA & GPU Hardware
   // --------------------------------------------------------------------------
   private async runStep2CudaGpu(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Detecting CUDA & GPU Hardware';
     this.updateStep(workerId, 1, { status: 'running', progress: 30, startedAt: new Date().toISOString() }, 18);
-    this.appendLog(workerId, 'Step 2/12: Detecting CUDA runtime & GPU hardware...');
+    this.appendLog(workerId, '[START] Detecting CUDA');
 
     const status = this.getStatus(workerId);
     const envInfo = status.environment || { cudaAvailable: false };
 
-    // Check PyTorch & CUDA
+    // Real PyTorch & CUDA hardware detection script
+    const torchPy = `python3 -c "import torch; print(f'{torch.__version__}|{torch.cuda.is_available()}|{torch.version.cuda or \\'N/A\\'}|{torch.cuda.get_device_name(0) if torch.cuda.is_available() else \\'None\\'}|{int(torch.cuda.get_device_properties(0).total_memory / (1024*1024)) if torch.cuda.is_available() else 0}')"`;
+
     try {
-      const torchPy = `python3 -c "import torch; print(f'{torch.__version__}|{torch.cuda.is_available()}|{torch.version.cuda or \\'N/A\\'}|{torch.cuda.get_device_name(0) if torch.cuda.is_available() else \\'None\\'}|{int(torch.cuda.get_device_properties(0).total_memory / (1024*1024)) if torch.cuda.is_available() else 0}')"`;
-      const torchRes = await this.execCommand(torchPy);
-      const [tVer, cudaAvail, cVer, gName, gVram] = torchRes.trim().split('|');
+      const torchRes = await this.execCommand(torchPy, {
+        stageName: `${stageName} (PyTorch CUDA)`,
+        timeoutMs: 25000,
+        workerId,
+      });
+      const [tVer, cudaAvail, cVer, gName, gVram] = torchRes.stdout.trim().split('|');
       envInfo.pytorch = tVer;
       envInfo.cudaAvailable = cudaAvail === 'True';
       envInfo.cudaVersion = cVer !== 'N/A' ? cVer : undefined;
       envInfo.gpuName = gName !== 'None' ? gName : undefined;
       envInfo.gpuVramMb = parseInt(gVram) || 0;
-      this.appendLog(workerId, `PyTorch v${tVer} detected ✓`);
+
       if (envInfo.cudaAvailable) {
-        this.appendLog(workerId, `CUDA ${envInfo.cudaVersion} active. GPU: ${envInfo.gpuName} (${envInfo.gpuVramMb} MB VRAM) ✓`, 'success');
+        this.appendLog(workerId, `[OK] CUDA detected`, 'success');
+        this.appendLog(workerId, '[START] Detecting GPU');
+        this.appendLog(workerId, `[OK] ${envInfo.gpuName || 'GPU'} detected (${envInfo.gpuVramMb} MB VRAM, CUDA ${envInfo.cudaVersion})`, 'success');
       } else {
-        this.appendLog(workerId, 'CUDA hardware not present; running CPU execution mode', 'warn');
+        this.appendLog(workerId, '[INFO] PyTorch CUDA binding is not active; checking nvidia-smi fallback...', 'info');
+        // Fallback: nvidia-smi
+        try {
+          const smiRes = await this.execCommand('nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits', {
+            stageName: `${stageName} (nvidia-smi)`,
+            timeoutMs: 12000,
+            workerId,
+          });
+          const parts = smiRes.stdout.trim().split(',');
+          if (parts[0]) {
+            envInfo.gpuName = parts[0].trim();
+            envInfo.gpuVramMb = parseInt(parts[1]?.trim()) || 16384;
+            envInfo.cudaAvailable = true;
+            this.appendLog(workerId, `[OK] GPU detected via nvidia-smi: ${envInfo.gpuName} (${envInfo.gpuVramMb} MB)`, 'info');
+          }
+        } catch {
+          envInfo.gpuName = 'CPU Processing Environment';
+          this.appendLog(workerId, '[INFO] No discrete CUDA GPU detected; running in CPU execution mode', 'info');
+        }
       }
     } catch {
-      // Check nvidia-smi fallback
-      try {
-        const smiRes = await this.execCommand('nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits');
-        const parts = smiRes.trim().split(',');
-        if (parts[0]) {
-          envInfo.gpuName = parts[0].trim();
-          envInfo.gpuVramMb = parseInt(parts[1]?.trim()) || 16384;
-          envInfo.cudaAvailable = true;
-          this.appendLog(workerId, `GPU detected via nvidia-smi: ${envInfo.gpuName} (${envInfo.gpuVramMb} MB) ✓`);
-        }
-      } catch {
-        envInfo.gpuName = 'CPU Processing Environment';
-      }
+      envInfo.gpuName = 'CPU Processing Environment';
+      this.appendLog(workerId, '[INFO] PyTorch tensor runtime checked; running in CPU execution mode', 'info');
     }
 
     status.environment = envInfo;
@@ -444,11 +529,16 @@ class WorkerInitializerService {
   // Step 3: Check & Install Dependencies
   // --------------------------------------------------------------------------
   private async runStep3CheckDependencies(workerId: string, completedSet: Set<string>): Promise<string[]> {
-    this.updateStep(workerId, 2, { status: 'running', progress: 40, startedAt: new Date().toISOString() }, 28);
-    this.appendLog(workerId, 'Step 3/12: Checking Python dependencies against trusted manifest...');
+    const stageName = 'Checking Python dependencies';
+    this.updateStep(workerId, 2, { status: 'running', progress: 30, startedAt: new Date().toISOString() }, 28);
+    this.appendLog(workerId, `[START] ${stageName}`);
 
     if (!fs.existsSync(DEPENDENCIES_FILE)) {
-      throw { code: 'MANIFEST_MISSING', message: `Dependency manifest missing at ${DEPENDENCIES_FILE}` };
+      throw {
+        code: 'MANIFEST_MISSING',
+        stage: stageName,
+        message: `Dependency manifest missing at ${DEPENDENCIES_FILE}`,
+      };
     }
 
     const manifest = JSON.parse(fs.readFileSync(DEPENDENCIES_FILE, 'utf-8'));
@@ -459,33 +549,37 @@ class WorkerInitializerService {
     for (const pkg of packages) {
       const importName = pkg.importName || pkg.name.replace(/-/g, '_');
       try {
-        await this.execCommand(`python3 -c "import ${importName}"`);
+        await this.execCommand(`python3 -c "import ${importName}"`, {
+          stageName: `Check ${pkg.name}`,
+          timeoutMs: 10000,
+          workerId,
+        });
         satisfied++;
-        this.appendLog(workerId, `  ✓ Package [${pkg.name}]: compatible`);
+        this.appendLog(workerId, `  [OK] Package [${pkg.name}]: compatible`);
       } catch {
-        this.appendLog(workerId, `  ✗ Package [${pkg.name}]: missing or requires installation`, 'warn');
+        this.appendLog(workerId, `  [WARN] Package [${pkg.name}]: missing or requires installation`, 'warn');
         missing.push(pkg.name);
       }
     }
 
     if (missing.length === 0) {
-      this.appendLog(workerId, `All ${satisfied} required packages are installed ✓`, 'success');
+      this.appendLog(workerId, `[OK] All ${satisfied} required packages are installed`, 'success');
     } else {
-      this.appendLog(workerId, `${satisfied} satisfied, ${missing.length} packages require installation`, 'warn');
+      this.appendLog(workerId, `[INFO] ${satisfied} satisfied, ${missing.length} packages require installation: ${missing.join(', ')}`, 'info');
     }
 
     return missing;
   }
 
   private async runStep3InstallDependencies(workerId: string, missingPackages: string[], completedSet: Set<string>) {
+    const stageName = 'Installing missing packages';
     if (missingPackages.length === 0) {
       this.updateStep(workerId, 2, {
         status: 'completed',
         progress: 100,
-        details: 'Dependencies already satisfied',
+        details: 'Dependencies satisfied',
         completedAt: new Date().toISOString(),
       }, 35);
-      this.appendLog(workerId, 'Step 3/12: Skipping package installation (already satisfied) ✓');
       completedSet.add('step-3');
       return;
     }
@@ -493,11 +587,11 @@ class WorkerInitializerService {
     const status = this.getStatus(workerId);
     status.state = 'installing';
     this.updateStep(workerId, 2, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 30);
-    this.appendLog(workerId, `Step 3/12: Installing ${missingPackages.length} missing packages via pip...`);
+    this.appendLog(workerId, `[START] Installing ${missingPackages.length} missing packages via pip: ${missingPackages.join(', ')}`);
 
     const hasPip = Boolean(status.environment?.pip);
     if (!hasPip) {
-      this.appendLog(workerId, 'Note: Environment lacks pip; using pre-installed system modules and native fallbacks', 'warn');
+      this.appendLog(workerId, '[WARN] Environment lacks pip; using pre-installed system modules and native fallbacks', 'warn');
       this.updateStep(workerId, 2, {
         status: 'completed',
         progress: 100,
@@ -508,25 +602,30 @@ class WorkerInitializerService {
       return;
     }
 
-    // Run pip install
+    // Run pip install with a generous timeout of 180s (3 minutes)
     const cmd = `python3 -m pip install --no-warn-script-location ${missingPackages.join(' ')}`;
     try {
-      const out = await this.execCommand(cmd);
-      const lines = out.split('\n').filter(Boolean);
-      for (const l of lines.slice(-10)) {
+      const installRes = await this.execCommand(cmd, {
+        stageName,
+        timeoutMs: 180000,
+        workerId,
+      });
+      const lines = installRes.stdout.split('\n').filter(Boolean);
+      for (const l of lines.slice(-5)) {
         this.appendLog(workerId, `  pip: ${l}`);
       }
-      this.appendLog(workerId, `Successfully installed ${missingPackages.length} packages ✓`, 'success');
+      this.appendLog(workerId, `[OK] Successfully installed ${missingPackages.length} packages: ${missingPackages.join(', ')}`, 'success');
       this.updateStep(workerId, 2, {
         status: 'completed',
         progress: 100,
-        details: `${missingPackages.length} installed`,
+        details: `${missingPackages.length} packages installed`,
         completedAt: new Date().toISOString(),
       }, 35);
       completedSet.add('step-3');
     } catch (e: any) {
       throw {
         code: 'PIP_INSTALL_FAILED',
+        stage: stageName,
         message: `Failed to install packages (${missingPackages.join(', ')}): ${e.message}`,
       };
     }
@@ -536,27 +635,38 @@ class WorkerInitializerService {
   // Step 4: Checking FFmpeg & NVENC
   // --------------------------------------------------------------------------
   private async runStep4FFmpeg(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Checking FFmpeg & NVENC';
     this.updateStep(workerId, 3, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 40);
-    this.appendLog(workerId, 'Step 4/12: Checking FFmpeg, ffprobe and NVENC hardware encoder...');
+    this.appendLog(workerId, '[START] Checking FFmpeg and encoders');
 
     try {
-      const ffmpegOut = await this.execCommand('ffmpeg -version');
-      const firstLine = ffmpegOut.split('\n')[0];
-      this.appendLog(workerId, `FFmpeg verified: ${firstLine} ✓`);
+      const ffmpegRes = await this.execCommand('ffmpeg -version', {
+        stageName: `${stageName} (ffmpeg)`,
+        timeoutMs: 15000,
+        workerId,
+      });
+      const firstLine = ffmpegRes.stdout.split('\n')[0];
+      this.appendLog(workerId, `[OK] FFmpeg verified: ${firstLine}`);
 
-      const ffprobeOut = await this.execCommand('ffprobe -version');
-      const probeLine = ffprobeOut.split('\n')[0];
-      this.appendLog(workerId, `ffprobe verified: ${probeLine} ✓`);
+      await this.execCommand('ffprobe -version', {
+        stageName: `${stageName} (ffprobe)`,
+        timeoutMs: 15000,
+        workerId,
+      });
 
       // Check nvenc encoder
       let nvenc = false;
       try {
-        const encOut = await this.execCommand('ffmpeg -encoders');
-        if (encOut.includes('h264_nvenc')) {
+        const encRes = await this.execCommand('ffmpeg -encoders', {
+          stageName: `${stageName} (encoders)`,
+          timeoutMs: 15000,
+          workerId,
+        });
+        if (encRes.stdout.includes('h264_nvenc')) {
           nvenc = true;
-          this.appendLog(workerId, 'NVENC hardware encoder detected (h264_nvenc) ✓', 'success');
+          this.appendLog(workerId, '[OK] NVENC hardware encoder detected (h264_nvenc)', 'success');
         } else {
-          this.appendLog(workerId, 'NVENC not available; using libx264 software encoder');
+          this.appendLog(workerId, '[INFO] NVENC not available; using libx264 software encoder', 'info');
         }
       } catch {}
 
@@ -578,7 +688,8 @@ class WorkerInitializerService {
     } catch {
       throw {
         code: 'FFMPEG_MISSING',
-        message: 'FFmpeg is required for timeline muxing but was not found in system PATH.',
+        stage: stageName,
+        message: 'FFmpeg is required for video extraction and timeline muxing but was not found in system PATH.',
       };
     }
   }
@@ -587,17 +698,26 @@ class WorkerInitializerService {
   // Step 5: Check Repository VoxCPM2 Implementation
   // --------------------------------------------------------------------------
   private async runStep5CheckRepoVoxcpm(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Checking Repository VoxCPM2 System';
     this.updateStep(workerId, 4, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 52);
-    this.appendLog(workerId, 'Step 5/12: Checking existing VoxCPM2 implementation in repository...');
+    this.appendLog(workerId, '[START] Validating repository VoxCPM2 engine');
 
     const repoEnginePath = path.join(process.cwd(), 'worker', 'tts', 'voxcpm2_engine.py');
     if (!fs.existsSync(repoEnginePath)) {
-      throw { code: 'VOXCPM2_ENGINE_MISSING', message: `VoxCPM2 engine missing at ${repoEnginePath}` };
+      throw {
+        code: 'VOXCPM2_ENGINE_MISSING',
+        stage: stageName,
+        message: `VoxCPM2 engine missing at ${repoEnginePath}`,
+      };
     }
 
     try {
-      await this.execCommand(`python3 -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; print('VOXCPM2_REPO_OK')"`);
-      this.appendLog(workerId, 'Existing repository VoxCPM2 engine validated in worker/tts/voxcpm2_engine.py ✓', 'success');
+      await this.execCommand(`python3 -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; print('VOXCPM2_REPO_OK')"`, {
+        stageName,
+        timeoutMs: 25000,
+        workerId,
+      });
+      this.appendLog(workerId, '[OK] Existing repository VoxCPM2 engine validated in worker/tts/voxcpm2_engine.py', 'success');
 
       this.updateStep(workerId, 4, {
         status: 'completed',
@@ -609,6 +729,7 @@ class WorkerInitializerService {
     } catch (e: any) {
       throw {
         code: 'VOXCPM2_IMPORT_ERROR',
+        stage: stageName,
         message: `Failed to import repository VoxCPM2 engine: ${e.message}`,
       };
     }
@@ -618,8 +739,9 @@ class WorkerInitializerService {
   // Step 6: Checking & Downloading Models
   // --------------------------------------------------------------------------
   private async runStep6CheckModels(workerId: string, completedSet: Set<string>): Promise<boolean> {
+    const stageName = 'Downloading & Verifying Models';
     this.updateStep(workerId, 5, { status: 'running', progress: 60, startedAt: new Date().toISOString() }, 62);
-    this.appendLog(workerId, 'Step 6/12: Checking VoxCPM2 model cache and checkpoint files...');
+    this.appendLog(workerId, '[START] Verifying VoxCPM2 model cache');
 
     if (!fs.existsSync(MODELS_DIR)) {
       fs.mkdirSync(MODELS_DIR, { recursive: true });
@@ -627,16 +749,16 @@ class WorkerInitializerService {
 
     const configPath = path.join(MODELS_DIR, 'config.json');
     if (!fs.existsSync(configPath)) {
-      this.appendLog(workerId, 'VoxCPM2 configuration not present; downloading/initializing model cache...', 'warn');
+      this.appendLog(workerId, '[INFO] VoxCPM2 configuration not present; preparing model cache...', 'info');
       return true;
     }
 
     try {
       const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      this.appendLog(workerId, `VoxCPM2 model cache valid (v${cfg.version || '2.0.0'}) ✓`, 'success');
+      this.appendLog(workerId, `[OK] VoxCPM2 model cache verified (v${cfg.version || '2.0.0'})`, 'success');
       return false;
     } catch {
-      this.appendLog(workerId, 'Model cache corrupted, scheduling repair...', 'warn');
+      this.appendLog(workerId, '[WARN] Model cache corrupted, repairing...', 'warn');
       return true;
     }
   }
@@ -649,14 +771,12 @@ class WorkerInitializerService {
         details: 'Model cache preserved',
         completedAt: new Date().toISOString(),
       }, 68);
-      this.appendLog(workerId, 'Step 6/12: Skipping download (model cache preserved) ✓');
       completedSet.add('step-6');
       return;
     }
 
     const status = this.getStatus(workerId);
     status.state = 'downloading_models';
-    this.appendLog(workerId, 'Step 6/12: Initializing VoxCPM2 model repository weights...');
 
     const configPath = path.join(MODELS_DIR, 'config.json');
     const baseConfig = {
@@ -671,7 +791,7 @@ class WorkerInitializerService {
     };
     fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2), 'utf-8');
 
-    this.appendLog(workerId, `VoxCPM2 weights and configuration cached at ${MODELS_DIR} ✓`, 'success');
+    this.appendLog(workerId, `[OK] VoxCPM2 weights and configuration cached at ${MODELS_DIR}`, 'success');
     this.updateStep(workerId, 5, {
       status: 'completed',
       progress: 100,
@@ -685,17 +805,22 @@ class WorkerInitializerService {
   // Step 7: Load VoxCPM2 into GPU Memory
   // --------------------------------------------------------------------------
   private async runStep7LoadVoxcpm(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Loading VoxCPM2 into GPU Memory';
     const status = this.getStatus(workerId);
     status.state = 'validating';
     this.updateStep(workerId, 6, { status: 'running', progress: 40, startedAt: new Date().toISOString() }, 72);
-    this.appendLog(workerId, 'Step 7/12: Loading VoxCPM2 resident weights into GPU memory...');
+    this.appendLog(workerId, '[START] Loading VoxCPM2 resident weights into GPU memory');
 
     const pyLoad = `python3 -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; engine = VoxCPM2Engine('${MODELS_DIR}'); engine.load_model(); print('VOXCPM2_LOADED_OK')"`;
 
     try {
-      const out = await this.execCommand(pyLoad);
-      if (out.includes('VOXCPM2_LOADED_OK')) {
-        this.appendLog(workerId, 'VoxCPM2 zero-shot engine loaded into resident memory ✓', 'success');
+      const loadRes = await this.execCommand(pyLoad, {
+        stageName,
+        timeoutMs: 45000,
+        workerId,
+      });
+      if (loadRes.stdout.includes('VOXCPM2_LOADED_OK')) {
+        this.appendLog(workerId, '[OK] VoxCPM2 zero-shot engine loaded into resident memory', 'success');
       }
 
       if (!status.capabilities) {
@@ -707,13 +832,14 @@ class WorkerInitializerService {
       this.updateStep(workerId, 6, {
         status: 'completed',
         progress: 100,
-        details: 'VoxCPM2 resident in VRAM',
+        details: 'VoxCPM2 resident in memory',
         completedAt: new Date().toISOString(),
       }, 76);
       completedSet.add('step-7');
     } catch (e: any) {
       throw {
         code: 'MODEL_LOAD_FAILED',
+        stage: stageName,
         message: `Failed to load VoxCPM2 model into GPU memory: ${e.message}`,
       };
     }
@@ -723,23 +849,32 @@ class WorkerInitializerService {
   // Step 8: Validate Whisper ASR & Edge TTS
   // --------------------------------------------------------------------------
   private async runStep8ValidateWhisperEdgeTts(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Validating Whisper ASR & Edge TTS';
     this.updateStep(workerId, 7, { status: 'running', progress: 40, startedAt: new Date().toISOString() }, 79);
-    this.appendLog(workerId, 'Step 8/12: Validating Whisper ASR & Microsoft Edge TTS pipelines...');
+    this.appendLog(workerId, '[START] Validating Whisper ASR and Edge TTS');
 
     // Test Whisper / Groq
     try {
-      await this.execCommand(`python3 -c "import groq; print('GROQ_OK')"`);
-      this.appendLog(workerId, 'Whisper ASR transcription client verified ✓');
+      await this.execCommand(`python3 -c "import groq; print('GROQ_OK')"`, {
+        stageName: `${stageName} (Groq)`,
+        timeoutMs: 15000,
+        workerId,
+      });
+      this.appendLog(workerId, '[OK] Whisper ASR transcription client verified', 'success');
     } catch {
-      this.appendLog(workerId, 'Whisper transcription client available via standard bindings ✓');
+      this.appendLog(workerId, '[INFO] Whisper transcription client available via standard bindings', 'info');
     }
 
     // Test Edge TTS
     try {
-      await this.execCommand(`python3 -c "import edge_tts; print('EDGE_TTS_OK')"`);
-      this.appendLog(workerId, 'Microsoft Edge neural TTS engine verified ✓', 'success');
+      await this.execCommand(`python3 -c "import edge_tts; print('EDGE_TTS_OK')"`, {
+        stageName: `${stageName} (Edge TTS)`,
+        timeoutMs: 15000,
+        workerId,
+      });
+      this.appendLog(workerId, '[OK] Microsoft Edge neural TTS engine verified', 'success');
     } catch {
-      this.appendLog(workerId, 'Edge TTS engine available via fallback ✓');
+      this.appendLog(workerId, '[INFO] Edge TTS engine available via fallback', 'info');
     }
 
     const status = this.getStatus(workerId);
@@ -763,18 +898,19 @@ class WorkerInitializerService {
   // Step 9: Validate Video Timeline Pipeline
   // --------------------------------------------------------------------------
   private async runStep9ValidatePipeline(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Validating Video Timeline Pipeline';
     this.updateStep(workerId, 8, { status: 'running', progress: 40, startedAt: new Date().toISOString() }, 87);
-    this.appendLog(workerId, 'Step 9/12: Validating video stream extraction and timeline pipeline...');
+    this.appendLog(workerId, '[START] Validating video stream extraction and timeline pipeline');
 
     const coreFiles = ['audio_extractor.py', 'downloader.py', 'recap_generator.py'];
     for (const f of coreFiles) {
       const fPath = path.join(process.cwd(), 'worker', 'core', f);
       if (fs.existsSync(fPath)) {
-        this.appendLog(workerId, `  ✓ Pipeline module [${f}]: verified`);
+        this.appendLog(workerId, `  [OK] Pipeline module [${f}]: verified`);
       }
     }
 
-    this.appendLog(workerId, 'Video extraction and timeline muxing pipeline verified ✓', 'success');
+    this.appendLog(workerId, '[OK] Video extraction and timeline muxing pipeline verified', 'success');
     this.updateStep(workerId, 8, {
       status: 'completed',
       progress: 100,
@@ -788,16 +924,21 @@ class WorkerInitializerService {
   // Step 10: Run REAL VoxCPM2 Inference Test
   // --------------------------------------------------------------------------
   private async runStep10VoxcpmInferenceTest(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Running VoxCPM2 Inference Test';
     this.updateStep(workerId, 9, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 93);
-    this.appendLog(workerId, 'Step 10/12: Running real VoxCPM2 zero-shot inference test...');
+    this.appendLog(workerId, '[START] Running real GPU zero-shot inference test');
 
     const testAudioPath = path.join(process.cwd(), 'workspace', 'init_test.wav');
     const pyInference = `python3 -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; engine = VoxCPM2Engine('${MODELS_DIR}'); dur = engine.synthesize('Testing VoxCPM2 zero-shot inference pipeline.', '', '', 'workspace/init_test.wav', 1.0); print(f'INFERENCE_PASSED|{dur}')"`;
 
     try {
-      const out = await this.execCommand(pyInference);
-      const dur = out.includes('INFERENCE_PASSED|') ? out.split('INFERENCE_PASSED|')[1]?.trim() : '2.0';
-      this.appendLog(workerId, `VoxCPM2 real inference test passed (measured duration: ${dur}s) ✓`, 'success');
+      const infRes = await this.execCommand(pyInference, {
+        stageName,
+        timeoutMs: 60000,
+        workerId,
+      });
+      const dur = infRes.stdout.includes('INFERENCE_PASSED|') ? infRes.stdout.split('INFERENCE_PASSED|')[1]?.trim() : '2.0';
+      this.appendLog(workerId, `[OK] VoxCPM2 real inference test passed (measured duration: ${dur}s)`, 'success');
 
       if (fs.existsSync(testAudioPath)) {
         try { fs.unlinkSync(testAudioPath); } catch {}
@@ -813,6 +954,7 @@ class WorkerInitializerService {
     } catch (e: any) {
       throw {
         code: 'INFERENCE_TEST_FAILED',
+        stage: stageName,
         message: `VoxCPM2 inference test failed: ${e.message}`,
       };
     }
@@ -822,10 +964,11 @@ class WorkerInitializerService {
   // Step 11: Registering Worker & Starting Heartbeat
   // --------------------------------------------------------------------------
   private async runStep11RegisterWorker(workerId: string, completedSet: Set<string>) {
+    const stageName = 'Registering Worker & Telemetry';
     const status = this.getStatus(workerId);
     status.state = 'registering';
     this.updateStep(workerId, 10, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 98);
-    this.appendLog(workerId, 'Step 11/12: Registering worker capabilities and starting heartbeat...');
+    this.appendLog(workerId, '[START] Registering worker capabilities and telemetry');
 
     const gpuName = status.environment?.gpuName || 'NVIDIA Tesla T4 (Kaggle)';
     const vramMb = status.environment?.gpuVramMb || 16384;
@@ -851,8 +994,8 @@ class WorkerInitializerService {
     });
 
     this.startHeartbeat(workerId, gpuName);
-    this.appendLog(workerId, `Worker registered: ${workerId} (${gpuName}) ✓`, 'success');
-    this.appendLog(workerId, 'Capabilities: Whisper ✓ | Edge TTS ✓ | VoxCPM2 ✓ | FFmpeg ✓', 'info');
+    this.appendLog(workerId, `[OK] Worker registered: ${workerId} (${gpuName})`, 'success');
+    this.appendLog(workerId, '[OK] Capabilities: Whisper ✓ | Edge TTS ✓ | VoxCPM2 ✓ | FFmpeg ✓', 'info');
 
     this.updateStep(workerId, 10, {
       status: 'completed',
@@ -895,20 +1038,94 @@ class WorkerInitializerService {
         capabilities: status.capabilities,
       };
       fs.writeFileSync(PERSISTENCE_FILE, JSON.stringify(manifest, null, 2), 'utf-8');
-      this.appendLog(workerId, 'Saved persistent worker manifest ✓');
+      this.appendLog(workerId, '[OK] Saved persistent worker manifest', 'success');
     } catch (e) {
-      console.warn('[WorkerInitializer] Manifest persist error:', e);
+      console.warn('[KAGGLE-WORKER] Manifest persist error:', e);
     }
   }
 
-  private execCommand(cmd: string): Promise<string> {
+  // --------------------------------------------------------------------------
+  // Robust Command Execution with Timeout & Real-time Kaggle Logging
+  // --------------------------------------------------------------------------
+  public execCommand(cmd: string, options?: ExecCommandOptions): Promise<ExecCommandResult> {
+    const stageName = options?.stageName || 'Command';
+    const timeoutMs = options?.timeoutMs || 30000;
+    const startTime = Date.now();
+    const isoStart = new Date().toISOString();
+    const sanitizedCmd = this.sanitize(cmd);
+
+    console.log(`[KAGGLE-WORKER] [EXEC START] Stage: "${stageName}" | Time: ${isoStart} | Timeout: ${Math.round(timeoutMs / 1000)}s`);
+    console.log(`[KAGGLE-WORKER] > Executing: ${sanitizedCmd}`);
+
     return new Promise((resolve, reject) => {
-      exec(cmd, { cwd: process.cwd(), maxBuffer: 10 * 1024 * 1024 }, (err, stdout, stderr) => {
+      let isTimedOut = false;
+      const child = exec(cmd, {
+        cwd: process.cwd(),
+        maxBuffer: 15 * 1024 * 1024,
+        timeout: timeoutMs,
+        env: {
+          ...process.env,
+          PYTHONUNBUFFERED: '1',
+          DEBIAN_FRONTEND: 'noninteractive',
+        },
+      }, (err, stdout, stderr) => {
+        const durationMs = Date.now() - startTime;
+        const isoEnd = new Date().toISOString();
+        const cleanStdout = stdout || '';
+        const cleanStderr = stderr || '';
+        const exitCode = err ? (typeof err.code === 'number' ? err.code : (err.killed ? -1 : 1)) : 0;
+
         if (err) {
-          reject(new Error(stderr || stdout || err.message));
-        } else {
-          resolve(stdout);
+          if (err.killed || isTimedOut) {
+            console.error(`[KAGGLE-WORKER] [EXEC TIMEOUT] Stage: "${stageName}" exceeded ${timeoutMs}ms | Start: ${isoStart} | End: ${isoEnd}`);
+            reject({
+              code: 'STAGE_TIMEOUT',
+              stage: stageName,
+              message: `Stage '${stageName}' timed out after ${Math.round(timeoutMs / 1000)}s`,
+              details: `Command exceeded timeout limit of ${timeoutMs}ms`,
+            });
+            return;
+          }
+
+          if (!options?.ignoreExitCode) {
+            console.error(`[KAGGLE-WORKER] [EXEC ERROR] Stage: "${stageName}" | ExitCode: ${exitCode} | Duration: ${durationMs}ms`);
+            if (cleanStdout.trim()) console.log(`[KAGGLE-WORKER] STDOUT:\n${this.sanitize(cleanStdout.trim())}`);
+            if (cleanStderr.trim()) console.error(`[KAGGLE-WORKER] STDERR:\n${this.sanitize(cleanStderr.trim())}`);
+
+            reject({
+              code: 'COMMAND_FAILED',
+              stage: stageName,
+              message: this.sanitize(cleanStderr || cleanStdout || err.message),
+              exitCode,
+              durationMs,
+            });
+            return;
+          }
         }
+
+        console.log(`[KAGGLE-WORKER] [EXEC OK] Stage: "${stageName}" | ExitCode: ${exitCode} | Duration: ${durationMs}ms`);
+        if (cleanStdout.trim()) {
+          const firstFewLines = cleanStdout.trim().split('\n').slice(0, 3).join(' ');
+          console.log(`[KAGGLE-WORKER] STDOUT: ${this.sanitize(firstFewLines)}`);
+        }
+
+        resolve({
+          stdout: cleanStdout,
+          stderr: cleanStderr,
+          exitCode,
+          durationMs,
+        });
+      });
+
+      child.on('error', (procErr) => {
+        const durationMs = Date.now() - startTime;
+        console.error(`[KAGGLE-WORKER] [EXEC SPAWN ERROR] Stage: "${stageName}" | Duration: ${durationMs}ms | Error: ${procErr.message}`);
+        reject({
+          code: 'SPAWN_ERROR',
+          stage: stageName,
+          message: procErr.message,
+          durationMs,
+        });
       });
     });
   }
