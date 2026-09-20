@@ -229,7 +229,7 @@ export const WorkerSetupScreen: React.FC<WorkerSetupScreenProps> = ({
                 className="w-full sm:w-auto px-6 py-3 rounded-xl bg-violet-600 hover:bg-violet-700 text-white font-semibold text-sm shadow-md shadow-violet-500/20 transition-all flex items-center justify-center space-x-2 active:scale-[0.99] cursor-pointer"
               >
                 <RefreshCw className={`w-4 h-4 ${loading ? 'animate-spin' : ''}`} />
-                <span>Retry (Safe Resume)</span>
+                <span>Retry Initialization</span>
               </button>
 
               <button
@@ -250,23 +250,23 @@ export const WorkerSetupScreen: React.FC<WorkerSetupScreenProps> = ({
             {/* Header / Intro */}
             <div className="space-y-3">
               <div className="flex items-center justify-between">
-                <div className="space-y-1">
+                <div className="space-y-1.5">
                   <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
-                    {isInitializing ? 'Initializing Kaggle Worker' : 'Kaggle GPU Worker Setup'}
+                    {isInitializing ? 'Initializing Kaggle GPU Worker...' : 'Kaggle GPU Worker Setup'}
                   </h1>
                   <p className="text-slate-600 text-sm max-w-xl leading-relaxed">
                     {isInitializing
-                      ? 'Automated environment verification in progress. Installing missing packages, validating FFmpeg, checking CUDA tensors, and loading VoxCPM2 models.'
-                      : 'Your Kaggle GPU worker needs to be initialized before processing videos. Click below to run the one-click initialization pipeline.'}
+                      ? 'Automated environment verification in progress. Detecting CUDA, verifying dependencies, loading resident VoxCPM2 models, and validating pipeline.'
+                      : 'The worker needs to initialize its required packages, models and GPU environment before the Movie Recap Studio can be opened.'}
                   </p>
                 </div>
 
                 <div className="hidden sm:flex flex-col items-end text-xs text-slate-500 space-y-1">
                   <div className="flex items-center space-x-1.5">
                     <Server className="w-3.5 h-3.5 text-violet-600" />
-                    <span className="font-semibold text-slate-700">Target: Kaggle GPU Worker</span>
+                    <span className="font-semibold text-slate-700">Kaggle GPU Worker</span>
                   </div>
-                  <div>ID: {status?.workerId || 'kaggle-gpu-worker'}</div>
+                  <div className="font-mono text-[11px] text-slate-400">ID: {status?.workerId || 'kaggle-gpu-worker'}</div>
                 </div>
               </div>
 
@@ -278,8 +278,8 @@ export const WorkerSetupScreen: React.FC<WorkerSetupScreenProps> = ({
                 </div>
                 <div className="flex items-center space-x-2">
                   <span className="text-slate-400">Status:</span>
-                  <span className={`font-semibold ${isInitializing ? 'text-violet-600' : 'text-amber-600'}`}>
-                    {isInitializing ? currentStep : 'Not Ready'}
+                  <span className={`font-semibold ${isInitializing ? 'text-violet-600' : 'text-slate-500'}`}>
+                    {isInitializing ? currentStep : 'Ready for initialization'}
                   </span>
                 </div>
               </div>
@@ -287,18 +287,18 @@ export const WorkerSetupScreen: React.FC<WorkerSetupScreenProps> = ({
 
             {/* Action Trigger for Pre-Init State */}
             {!isInitializing && (
-              <div className="py-2 text-center space-y-4">
+              <div className="py-4 text-center space-y-4">
                 <button
                   type="button"
                   onClick={onInitialize}
                   disabled={loading}
-                  className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white font-semibold text-base shadow-lg shadow-violet-500/25 transition-all flex items-center justify-center space-x-2.5 mx-auto active:scale-[0.99] cursor-pointer"
+                  className="px-8 py-3.5 rounded-xl bg-gradient-to-r from-violet-600 to-indigo-600 hover:from-violet-700 hover:to-indigo-700 text-white font-semibold text-base shadow-lg shadow-violet-500/25 transition-all flex items-center justify-center space-x-2.5 mx-auto active:scale-[0.99] cursor-pointer disabled:opacity-50"
                 >
                   <Sparkles className="w-5 h-5" />
                   <span>Initialize Worker</span>
                 </button>
-                <p className="text-xs text-slate-500">
-                  One click performs full environment verification, pip install, and resident model preparation.
+                <p className="text-xs text-slate-500 max-w-md mx-auto">
+                  Click to detect GPU, verify packages, load resident VoxCPM2 models into memory, and validate the video recap pipeline.
                 </p>
               </div>
             )}
