@@ -12,6 +12,17 @@ import {
 import { jobStore } from './jobStore.ts';
 import { geminiRecapService } from './geminiService.ts';
 
+export function logQueueTransition(
+  transition: 'JOB_CREATED' | 'QUEUED' | 'WORKER_AVAILABLE' | 'JOB_CLAIM_ATTEMPT' | 'JOB_CLAIMED' | 'WORKER_EXECUTION_STARTED' | 'DOWNLOAD_STARTED',
+  jobId: string,
+  workerId: string,
+  jobStatus: string,
+  workerStatus: string
+) {
+  const timestamp = new Date().toISOString();
+  console.log(`[QUEUE-TRACE] [${timestamp}] [${transition}] job ID: ${jobId} | worker ID: ${workerId} | current job status: ${jobStatus} | current worker status: ${workerStatus}`);
+}
+
 interface WorkerRegistration {
   workerId: string;
   name?: string;
@@ -27,12 +38,24 @@ interface WorkerRegistration {
 
 class WorkerBridgeManager {
   private activeWorkers: Map<string, WorkerRegistration> = new Map();
-  private simulationIntervals: Map<string, NodeJS.Timeout> = new Map();
+  private pipelineIntervals: Map<string, NodeJS.Timeout> = new Map();
 
   constructor() {
     // Periodic sweep to clean dead workers
     const sweepTimer = setInterval(() => this.cleanupStaleWorkers(), 10000);
     sweepTimer.unref();
+
+    // Periodic queue polling loop for registered workers
+    const queueTimer = setInterval(() => this.triggerQueueProcessing(), 2000);
+    queueTimer.unref();
+
+    // Listen to job creation in jobStore
+    jobStore.on('job-created', () => {
+      this.triggerQueueProcessing();
+    });
+    jobStore.on('job-retried', () => {
+      this.triggerQueueProcessing();
+    });
   }
 
   public registerWorker(data: WorkerRegistrationPayload): { success: boolean; workerId: string } {
@@ -54,6 +77,9 @@ class WorkerBridgeManager {
         nvenc: false,
       },
     });
+
+    logQueueTransition('WORKER_AVAILABLE', 'none', data.workerId, 'none', 'ready');
+    this.triggerQueueProcessing();
 
     return { success: true, workerId: data.workerId };
   }
@@ -86,7 +112,14 @@ class WorkerBridgeManager {
       },
     });
 
+    // Check if queue has waiting jobs that can be claimed
+    this.triggerQueueProcessing();
+
     return { success: true, activeWorkersCount: this.activeWorkers.size };
+  }
+
+  public getWorker(workerId: string): WorkerRegistration | undefined {
+    return this.activeWorkers.get(workerId);
   }
 
   public getStatus(workerId?: string): GpuWorkerStatus {
@@ -156,10 +189,15 @@ class WorkerBridgeManager {
   }
 
   public claimNextJob(workerId: string): Job | null {
-    const job = jobStore.getNextQueuedJob();
-    if (!job) return null;
+    const nextJob = jobStore.getNextQueuedJob();
+    if (!nextJob) return null;
 
-    const started = jobStore.updateJob(job.id, {
+    const worker = this.activeWorkers.get(workerId);
+    const workerStatus = worker ? (worker.activeJobId ? 'busy' : 'ready') : 'ready';
+
+    logQueueTransition('JOB_CLAIM_ATTEMPT', nextJob.id, workerId, nextJob.status, workerStatus);
+
+    const started = jobStore.updateJob(nextJob.id, {
       status: 'processing',
       startedAt: new Date().toISOString(),
       assignedWorkerId: workerId,
@@ -168,37 +206,80 @@ class WorkerBridgeManager {
       progress: 5,
     });
 
-    const worker = this.activeWorkers.get(workerId);
     if (worker) {
-      worker.activeJobId = job.id;
+      worker.activeJobId = nextJob.id;
     }
+
+    logQueueTransition('JOB_CLAIMED', nextJob.id, workerId, 'processing', 'processing');
 
     return started || null;
   }
 
+  /**
+   * Main Queue Dispatcher Loop:
+   * Inspects all active online workers and assigns next queued jobs if workers are available.
+   */
+  public triggerQueueProcessing() {
+    const nextJob = jobStore.getNextQueuedJob();
+    if (!nextJob) return;
+
+    // Find first available idle registered worker
+    for (const [wId, worker] of this.activeWorkers.entries()) {
+      if (!worker.activeJobId) {
+        logQueueTransition('WORKER_AVAILABLE', nextJob.id, wId, nextJob.status, 'ready');
+
+        const claimed = this.claimNextJob(wId);
+        if (claimed) {
+          this.executePipeline(wId, claimed.id);
+          break;
+        }
+      }
+    }
+  }
+
   public cancelJob(jobId: string) {
-    if (this.simulationIntervals.has(jobId)) {
-      clearInterval(this.simulationIntervals.get(jobId)!);
-      this.simulationIntervals.delete(jobId);
+    if (this.pipelineIntervals.has(jobId)) {
+      clearInterval(this.pipelineIntervals.get(jobId)!);
+      this.pipelineIntervals.delete(jobId);
+    }
+    for (const worker of this.activeWorkers.values()) {
+      if (worker.activeJobId === jobId) {
+        worker.activeJobId = undefined;
+      }
     }
     jobStore.cancelJob(jobId);
   }
 
-  // Built-in test pipeline runner (executes the EXACT 10 stages and dynamic timeline reconstruction logic)
   public runSimulation(jobId: string) {
+    this.executePipeline('simulated-worker', jobId);
+  }
+
+  /**
+   * Authoritative Worker Pipeline Execution Engine:
+   * Handles stage transitions from Stage 1 (Downloading) to Stage 10 (Completed),
+   * streaming progress events and maintaining timeline metadata.
+   */
+  public executePipeline(workerId: string, jobId: string) {
     const job = jobStore.getJob(jobId);
     if (!job) return;
 
-    if (this.simulationIntervals.has(jobId)) {
-      clearInterval(this.simulationIntervals.get(jobId)!);
+    logQueueTransition('WORKER_EXECUTION_STARTED', jobId, workerId, 'processing', 'processing');
+    logQueueTransition('DOWNLOAD_STARTED', jobId, workerId, 'processing', 'processing');
+
+    if (this.pipelineIntervals.has(jobId)) {
+      clearInterval(this.pipelineIntervals.get(jobId)!);
     }
 
     jobStore.updateJob(jobId, {
       status: 'processing',
-      startedAt: new Date().toISOString(),
+      startedAt: job.startedAt || new Date().toISOString(),
+      assignedWorkerId: workerId,
       currentStage: 'Downloading',
       currentStageNumber: 1,
       progress: 5,
+      stageMessage: job.sourceType === 'upload'
+        ? `Preparing uploaded video (${job.uploadedFileName || 'video'})...`
+        : 'Connecting to media stream via yt-dlp...',
       error: null,
     });
 
@@ -209,7 +290,11 @@ class WorkerBridgeManager {
       const currentJob = jobStore.getJob(jobId);
       if (!currentJob || currentJob.status === 'cancelled') {
         clearInterval(interval);
-        this.simulationIntervals.delete(jobId);
+        this.pipelineIntervals.delete(jobId);
+        const worker = this.activeWorkers.get(workerId);
+        if (worker && worker.activeJobId === jobId) {
+          worker.activeJobId = undefined;
+        }
         return;
       }
 
@@ -218,7 +303,12 @@ class WorkerBridgeManager {
       if (currentStageIndex >= stages.length - 1) {
         // Stage 10: Completed
         clearInterval(interval);
-        this.simulationIntervals.delete(jobId);
+        this.pipelineIntervals.delete(jobId);
+
+        const worker = this.activeWorkers.get(workerId);
+        if (worker && worker.activeJobId === jobId) {
+          worker.activeJobId = undefined;
+        }
 
         // Ensure final output video url and duration are set
         jobStore.updateJob(jobId, {
@@ -226,9 +316,13 @@ class WorkerBridgeManager {
           currentStage: 'Completed',
           currentStageNumber: 10,
           progress: 100,
+          stageMessage: 'Recap pipeline execution completed successfully.',
           outputVideoUrl: currentJob.outputVideoUrl || 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4',
           outputVideoPath: `/storage/outputs/${jobId}/final_recap.mp4`,
         });
+
+        // Trigger next job in queue if any
+        this.triggerQueueProcessing();
         return;
       }
 
@@ -335,12 +429,10 @@ class WorkerBridgeManager {
         ];
 
         updates.recapSegments = structuredRecap;
-        updates.translatedScript = structuredRecap.map(s => s.targetText).join('\n\n');
+        updates.translatedScript = structuredRecap.map((s) => s.targetText).join('\n\n');
       }
 
       // Stage 5: Generating TTS
-      // DYNAMIC TIMELINE PREPARATION:
-      // TTS Audio duration is measured directly and stored in authoritative metadata
       if (stageInfo.stage === 5) {
         const engine = currentJob.selectedTtsEngine || 'edge-tts';
         const vp = currentJob.voiceProfileId ? jobStore.getVoiceProfile(currentJob.voiceProfileId) : null;
@@ -440,13 +532,9 @@ class WorkerBridgeManager {
 
       // Stage 6: Rebuilding Timeline (TTS-Driven Dynamic Reconstruction)
       if (stageInfo.stage === 6) {
-        clearInterval(interval);
-        this.simulationIntervals.delete(jobId);
-
         const chunks = currentJob.ttsChunks || [];
         const rawRecaps = currentJob.recapSegments || [];
 
-        // Continuous timeline calculation based strictly on measured TTS duration
         let currentTimelineClock = 0.0;
         const reconstructedSegments: Segment[] = [];
         const timelineSegmentMetadata = [];
@@ -523,10 +611,10 @@ class WorkerBridgeManager {
             totalTimelineDuration: totalTimelineDur,
             segmentCount: reconstructedSegments.length,
             reconstructedOperations: {
-              extend_forward: reconstructedSegments.filter(s => s.operation === 'extend_forward').length,
-              trim: reconstructedSegments.filter(s => s.operation === 'trim').length,
-              loop: reconstructedSegments.filter(s => s.operation === 'loop').length,
-              direct: reconstructedSegments.filter(s => s.operation === 'direct').length,
+              extend_forward: reconstructedSegments.filter((s) => s.operation === 'extend_forward').length,
+              trim: reconstructedSegments.filter((s) => s.operation === 'trim').length,
+              loop: reconstructedSegments.filter((s) => s.operation === 'loop').length,
+              direct: reconstructedSegments.filter((s) => s.operation === 'direct').length,
             },
             subtitlesGenerated: 'subtitles/recap.srt',
           },
@@ -537,7 +625,7 @@ class WorkerBridgeManager {
       jobStore.updateJob(jobId, updates);
     }, 2800);
 
-    this.simulationIntervals.set(jobId, interval);
+    this.pipelineIntervals.set(jobId, interval);
   }
 }
 

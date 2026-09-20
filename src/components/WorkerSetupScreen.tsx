@@ -252,12 +252,12 @@ export const WorkerSetupScreen: React.FC<WorkerSetupScreenProps> = ({
               <div className="flex items-center justify-between">
                 <div className="space-y-1.5">
                   <h1 className="text-2xl sm:text-3xl font-bold tracking-tight text-slate-900">
-                    {isInitializing ? 'Initializing Kaggle GPU Worker...' : 'Kaggle GPU Worker Setup'}
+                    {isInitializing ? 'Verifying Kaggle GPU Worker...' : 'Kaggle GPU Worker Setup'}
                   </h1>
                   <p className="text-slate-600 text-sm max-w-xl leading-relaxed">
                     {isInitializing
                       ? 'Automated environment verification in progress. Detecting CUDA, verifying dependencies, loading resident VoxCPM2 models, and validating pipeline.'
-                      : 'The worker needs to initialize its required packages, models and GPU environment before the Movie Recap Studio can be opened.'}
+                      : 'The worker needs to verify its required packages, models and GPU environment before the Movie Recap Studio can be opened.'}
                   </p>
                 </div>
 

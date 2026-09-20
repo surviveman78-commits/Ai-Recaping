@@ -299,6 +299,12 @@ class JobStoreManager extends EventEmitter {
     };
 
     this.jobs.set(id, newJob);
+
+    const timestamp = new Date().toISOString();
+    console.log(`[QUEUE-TRACE] [${timestamp}] [JOB_CREATED] job ID: ${id} | worker ID: ${newJob.assignedWorkerId || 'unassigned'} | current job status: ${newJob.status} | current worker status: ready`);
+    console.log(`[QUEUE-TRACE] [${timestamp}] [QUEUED] job ID: ${id} | worker ID: ${newJob.assignedWorkerId || 'unassigned'} | current job status: queued | current worker status: ready`);
+
+    this.emit('job-created', newJob);
     this.emit('job-updated', newJob);
     this.emit(`job-${id}`, newJob);
     return newJob;

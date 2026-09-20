@@ -20,12 +20,12 @@ const DEPENDENCIES_FILE = path.join(process.cwd(), 'worker', 'kaggle', 'dependen
 const MODELS_DIR = path.join(process.cwd(), 'models', 'voxcpm2');
 
 const INITIAL_STEPS: { id: string; name: string; description: string }[] = [
-  { id: 'step-1', name: 'Detecting Python Environment', description: 'Checking Python 3 runtime and pip package installer' },
+  { id: 'step-1', name: 'Detecting Python Environment', description: 'Checking Python 3 runtime and environment' },
   { id: 'step-2', name: 'Detecting CUDA & GPU Hardware', description: 'Checking PyTorch CUDA tensor bindings and hardware GPU device' },
-  { id: 'step-3', name: 'Checking & Installing Missing Packages', description: 'Verifying dependencies against manifest and installing missing packages' },
+  { id: 'step-3', name: 'Checking Required Packages', description: 'Verifying that required Python packages import successfully' },
   { id: 'step-4', name: 'Checking FFmpeg & NVENC Acceleration', description: 'Validating FFmpeg, ffprobe binaries, and h264_nvenc hardware encoder' },
   { id: 'step-5', name: 'Checking Repository VoxCPM2 System', description: 'Verifying repository VoxCPM2 engine implementation in worker/tts/' },
-  { id: 'step-6', name: 'Downloading & Verifying Models', description: 'Verifying VoxCPM2 resident model checkpoint files and cache' },
+  { id: 'step-6', name: 'Checking VoxCPM2 Model', description: 'Verifying VoxCPM2 resident model checkpoint files and configuration' },
   { id: 'step-7', name: 'Loading VoxCPM2 into GPU Memory', description: 'Loading VoxCPM2 neural voice model into GPU/CUDA memory' },
   { id: 'step-8', name: 'Validating Whisper ASR & Edge TTS', description: 'Validating Whisper transcription bindings and Microsoft Edge TTS' },
   { id: 'step-9', name: 'Validating Video Timeline Pipeline', description: 'Testing stream extraction, timeline reconstruction, and FFmpeg muxer' },
@@ -321,10 +321,9 @@ class WorkerInitializerService {
       currentStepNumber = 2;
       await this.runStep2CudaGpu(workerId, completedSet);
 
-      // Step 3: Check & Install Missing Python Packages
+      // Step 3: Check Required Python Packages
       currentStepNumber = 3;
-      const missingPackages = await this.runStep3CheckDependencies(workerId, completedSet);
-      await this.runStep3InstallDependencies(workerId, missingPackages, completedSet);
+      await this.runStep3VerifyPackages(workerId, completedSet);
 
       // Step 4: Check FFmpeg & NVENC Acceleration
       currentStepNumber = 4;
@@ -334,10 +333,9 @@ class WorkerInitializerService {
       currentStepNumber = 5;
       await this.runStep5CheckRepoVoxcpm(workerId, completedSet);
 
-      // Step 6: Download & Verify Models
+      // Step 6: Check VoxCPM2 Model
       currentStepNumber = 6;
-      const needsModelDownload = await this.runStep6CheckModels(workerId, completedSet);
-      await this.runStep6DownloadModels(workerId, needsModelDownload, completedSet);
+      await this.runStep6VerifyVoxcpmModel(workerId, completedSet);
 
       // Step 7: Load VoxCPM2 into GPU Memory
       currentStepNumber = 7;
@@ -621,11 +619,11 @@ class WorkerInitializerService {
   }
 
   // --------------------------------------------------------------------------
-  // Step 3: Check & Install Dependencies
+  // Step 3: Checking Required Packages (Verification-only, no installation)
   // --------------------------------------------------------------------------
-  private async runStep3CheckDependencies(workerId: string, completedSet: Set<string>): Promise<string[]> {
+  private async runStep3VerifyPackages(workerId: string, completedSet: Set<string>) {
     const stepNum = 3;
-    const stageName = 'Checking Python dependencies';
+    const stageName = 'Checking Required Packages';
     console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 2, { status: 'running', progress: 30, startedAt: new Date().toISOString() }, 28);
     this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
@@ -648,92 +646,40 @@ class WorkerInitializerService {
       const importName = pkg.importName || pkg.name.replace(/-/g, '_');
       try {
         await this.execCommand(`${pyBin} -c "import ${importName}"`, {
-          stageName: `Check ${pkg.name}`,
+          stageName: `Verify ${pkg.name}`,
           stepNumber: 3,
           timeoutMs: 10000,
           workerId,
         });
         satisfied++;
-        this.appendLog(workerId, `  [OK] Package [${pkg.name}]: compatible`);
+        this.appendLog(workerId, `  [OK] Package [${pkg.name}] (${importName}): verified import`);
       } catch {
-        this.appendLog(workerId, `  [WARN] Package [${pkg.name}]: missing or requires installation`, 'warn');
-        missing.push(pkg.name);
+        this.appendLog(workerId, `  [FAIL] Package [${pkg.name}] (${importName}): import failed`, 'warn');
+        if (pkg.required !== false) {
+          missing.push(pkg.name);
+        }
       }
     }
 
-    if (missing.length === 0) {
-      this.appendLog(workerId, `[OK] All ${satisfied} required packages are installed`, 'success');
-    } else {
-      this.appendLog(workerId, `[INFO] ${satisfied} satisfied, ${missing.length} packages require installation: ${missing.join(', ')}`, 'info');
-    }
-
-    return missing;
-  }
-
-  private async runStep3InstallDependencies(workerId: string, missingPackages: string[], completedSet: Set<string>) {
-    const stepNum = 3;
-    const stageName = 'Installing missing packages';
-    if (missingPackages.length === 0) {
-      this.updateStep(workerId, 2, {
-        status: 'completed',
-        progress: 100,
-        details: 'Dependencies satisfied',
-        completedAt: new Date().toISOString(),
-      }, 35);
-      completedSet.add('step-3');
-      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
-      return;
-    }
-
-    const status = this.getStatus(workerId);
-    status.state = 'installing';
-    this.updateStep(workerId, 2, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 30);
-    this.appendLog(workerId, `[START] Installing ${missingPackages.length} missing packages via pip: ${missingPackages.join(', ')}`);
-
-    const hasPip = Boolean(status.environment?.pip);
-    if (!hasPip) {
-      this.appendLog(workerId, '[WARN] Environment lacks pip; using pre-installed system modules and native fallbacks', 'warn');
-      this.updateStep(workerId, 2, {
-        status: 'completed',
-        progress: 100,
-        details: 'System bindings active',
-        completedAt: new Date().toISOString(),
-      }, 35);
-      completedSet.add('step-3');
-      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
-      return;
-    }
-
-    const pyBin = this.resolvedPythonBin;
-    const cmd = `${pyBin} -m pip install --no-warn-script-location ${missingPackages.join(' ')}`;
-    try {
-      const installRes = await this.execCommand(cmd, {
-        stageName,
-        stepNumber: 3,
-        timeoutMs: 180000,
-        workerId,
-      });
-      const lines = installRes.stdout.split('\n').filter(Boolean);
-      for (const l of lines.slice(-5)) {
-        this.appendLog(workerId, `  pip: ${l}`);
-      }
-      this.appendLog(workerId, `[OK] Successfully installed ${missingPackages.length} packages: ${missingPackages.join(', ')}`, 'success');
-      this.updateStep(workerId, 2, {
-        status: 'completed',
-        progress: 100,
-        details: `${missingPackages.length} packages installed`,
-        completedAt: new Date().toISOString(),
-      }, 35);
-      completedSet.add('step-3');
-      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
-    } catch (e: any) {
+    if (missing.length > 0) {
+      this.appendLog(workerId, `[FAIL] ${missing.length} required packages missing: ${missing.join(', ')}`, 'error');
       throw {
-        code: 'PIP_INSTALL_FAILED',
+        code: 'PACKAGES_MISSING',
         stage: stageName,
-        message: `Failed to install packages (${missingPackages.join(', ')}): ${e.message}`,
-        details: e.details,
+        message: `Missing ${missing.length} required Python package(s): ${missing.join(', ')}. Please ensure the Kaggle environment preparation notebook has completed with all dependencies installed.`,
+        details: `Failed to import packages: ${missing.join(', ')}`,
       };
     }
+
+    this.appendLog(workerId, `[OK] All ${satisfied} required Python packages verified successfully`, 'success');
+    this.updateStep(workerId, 2, {
+      status: 'completed',
+      progress: 100,
+      details: `${satisfied} packages verified`,
+      completedAt: new Date().toISOString(),
+    }, 35);
+    completedSet.add('step-3');
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   // --------------------------------------------------------------------------
@@ -852,74 +798,54 @@ class WorkerInitializerService {
   }
 
   // --------------------------------------------------------------------------
-  // Step 6: Checking & Downloading Models
+  // Step 6: Checking VoxCPM2 Model (Verification-only, no downloading)
   // --------------------------------------------------------------------------
-  private async runStep6CheckModels(workerId: string, completedSet: Set<string>): Promise<boolean> {
+  private async runStep6VerifyVoxcpmModel(workerId: string, completedSet: Set<string>) {
     const stepNum = 6;
-    const stageName = 'Downloading & Verifying Models';
+    const stageName = 'Checking VoxCPM2 Model';
     console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
-    this.updateStep(workerId, 5, { status: 'running', progress: 60, startedAt: new Date().toISOString() }, 62);
+    this.updateStep(workerId, 5, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 62);
     this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     if (!fs.existsSync(MODELS_DIR)) {
-      fs.mkdirSync(MODELS_DIR, { recursive: true });
+      throw {
+        code: 'MODEL_DIRECTORY_MISSING',
+        stage: stageName,
+        message: `VoxCPM2 model directory missing at ${MODELS_DIR}. Please ensure the Kaggle environment preparation notebook has downloaded or prepared the models directory.`,
+      };
     }
 
     const configPath = path.join(MODELS_DIR, 'config.json');
     if (!fs.existsSync(configPath)) {
-      this.appendLog(workerId, '[INFO] VoxCPM2 configuration not present; preparing model cache...', 'info');
-      return true;
+      throw {
+        code: 'MODEL_CONFIG_MISSING',
+        stage: stageName,
+        message: `VoxCPM2 resident model configuration missing at ${configPath}. Please ensure the Kaggle environment preparation notebook downloaded the model checkpoints.`,
+      };
     }
 
     try {
       const cfg = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
-      this.appendLog(workerId, `[OK] VoxCPM2 model cache verified (v${cfg.version || '2.0.0'})`, 'success');
-      return false;
-    } catch {
-      this.appendLog(workerId, '[WARN] Model cache corrupted, repairing...', 'warn');
-      return true;
-    }
-  }
-
-  private async runStep6DownloadModels(workerId: string, needed: boolean, completedSet: Set<string>) {
-    const stepNum = 6;
-    if (!needed && completedSet.has('step-6')) {
+      if (!cfg.model_type || !cfg.version) {
+        throw new Error('Missing model_type or version properties in config.json');
+      }
+      this.appendLog(workerId, `[OK] VoxCPM2 model cache verified (v${cfg.version || '2.0.0'}, ${cfg.model_type})`, 'success');
       this.updateStep(workerId, 5, {
-        status: 'skipped',
+        status: 'completed',
         progress: 100,
-        details: 'Model cache preserved',
+        details: `VoxCPM2 v${cfg.version || '2.0.0'} verified`,
         completedAt: new Date().toISOString(),
       }, 68);
       completedSet.add('step-6');
       console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
-      return;
+    } catch (e: any) {
+      throw {
+        code: 'MODEL_CONFIG_CORRUPTED',
+        stage: stageName,
+        message: `VoxCPM2 model configuration corrupted: ${e.message}`,
+        details: e.stack,
+      };
     }
-
-    const status = this.getStatus(workerId);
-    status.state = 'downloading_models';
-
-    const configPath = path.join(MODELS_DIR, 'config.json');
-    const baseConfig = {
-      model_type: 'voxcpm2_zero_shot',
-      version: '2.0.0',
-      sample_rate: 24000,
-      latent_dim: 512,
-      diffusion_steps: 30,
-      guidance_scale: 3.5,
-      supported_languages: ['en', 'it', 'es', 'fr', 'de', 'my', 'ja', 'pt', 'hi'],
-      cachedAt: new Date().toISOString(),
-    };
-    fs.writeFileSync(configPath, JSON.stringify(baseConfig, null, 2), 'utf-8');
-
-    this.appendLog(workerId, `[OK] VoxCPM2 weights and configuration cached at ${MODELS_DIR}`, 'success');
-    this.updateStep(workerId, 5, {
-      status: 'completed',
-      progress: 100,
-      details: 'VoxCPM2 weights cached',
-      completedAt: new Date().toISOString(),
-    }, 68);
-    completedSet.add('step-6');
-    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   // --------------------------------------------------------------------------

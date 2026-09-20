@@ -106,6 +106,9 @@ router.post('/', (req: Request, res: Response) => {
       targetLanguage,
     });
 
+    // Trigger queue processing for online workers
+    workerBridge.triggerQueueProcessing();
+
     // If autoSimulate is true or worker is not currently online, start pipeline runner
     const workerStatus = workerBridge.getStatus();
     if (autoSimulate || !workerStatus.isOnline) {

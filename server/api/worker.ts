@@ -178,11 +178,22 @@ router.post('/poll', verifyWorkerAuth, (req: Request, res: Response) => {
     return;
   }
 
+  const worker = workerBridge.getWorker(workerId);
+  if (worker && !worker.activeJobId) {
+    const nextQueued = jobStore.getNextQueuedJob();
+    if (nextQueued) {
+      console.log(`[QUEUE-TRACE] [${new Date().toISOString()}] [WORKER_AVAILABLE] job ID: ${nextQueued.id} | worker ID: ${workerId} | current job status: ${nextQueued.status} | current worker status: ready`);
+    }
+  }
+
   const job = workerBridge.claimNextJob(workerId);
   if (!job) {
     res.json({ job: null });
     return;
   }
+
+  console.log(`[QUEUE-TRACE] [${new Date().toISOString()}] [WORKER_EXECUTION_STARTED] job ID: ${job.id} | worker ID: ${workerId} | current job status: processing | current worker status: processing`);
+  console.log(`[QUEUE-TRACE] [${new Date().toISOString()}] [DOWNLOAD_STARTED] job ID: ${job.id} | worker ID: ${workerId} | current job status: processing | current worker status: processing`);
 
   // Include voice profile details if voxcpm2
   let voiceProfile = null;
@@ -242,6 +253,13 @@ router.post('/jobs/:id/complete', verifyWorkerAuth, (req: Request, res: Response
     return;
   }
 
+  if (job.assignedWorkerId) {
+    const worker = workerBridge.getWorker(job.assignedWorkerId);
+    if (worker && worker.activeJobId === jobId) {
+      worker.activeJobId = undefined;
+    }
+  }
+
   const updated = jobStore.updateJob(jobId, {
     status: 'completed',
     currentStage: 'Completed',
@@ -257,6 +275,8 @@ router.post('/jobs/:id/complete', verifyWorkerAuth, (req: Request, res: Response
     metrics: metrics ? { ...job.metrics, ...metrics } : job.metrics,
   });
 
+  workerBridge.triggerQueueProcessing();
+
   res.json(updated);
 });
 
@@ -264,6 +284,14 @@ router.post('/jobs/:id/complete', verifyWorkerAuth, (req: Request, res: Response
 router.post('/jobs/:id/fail', verifyWorkerAuth, (req: Request, res: Response) => {
   const jobId = req.params.id;
   const { stage, code, message, retryable, details } = req.body;
+
+  const job = jobStore.getJob(jobId);
+  if (job?.assignedWorkerId) {
+    const worker = workerBridge.getWorker(job.assignedWorkerId);
+    if (worker && worker.activeJobId === jobId) {
+      worker.activeJobId = undefined;
+    }
+  }
 
   const structuredError: StructuredError = {
     stage: stage || 'processing',
@@ -278,6 +306,8 @@ router.post('/jobs/:id/fail', verifyWorkerAuth, (req: Request, res: Response) =>
     res.status(404).json({ error: 'Job not found' });
     return;
   }
+
+  workerBridge.triggerQueueProcessing();
 
   res.json(failed);
 });
