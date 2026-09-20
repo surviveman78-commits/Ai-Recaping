@@ -306,3 +306,12 @@ export function subscribeWorkerInitialization(
   };
 }
 
+export async function fetchDebugInitialization(workerId: string = 'kaggle-gpu-worker') {
+  const res = await fetch(`${BASE_URL}/api/workers/debug-initialization?workerId=${encodeURIComponent(workerId)}`);
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error(err.error || 'Failed to fetch debug initialization');
+  }
+  return res.json();
+}
+

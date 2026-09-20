@@ -2,8 +2,8 @@
   "workerId": "test-worker-1",
   "name": "Kaggle GPU Worker",
   "status": "ready",
-  "sessionId": "sess_1789918528967_9otts7v",
-  "initializedAt": "2026-09-20T15:35:31.507Z",
+  "sessionId": "sess_1789919119568_k9mgdt6",
+  "initializedAt": "2026-09-20T15:45:22.013Z",
   "environment": {
     "cudaAvailable": false,
     "python": "3.10.12",

@@ -74,6 +74,19 @@ export function useWorkerInitialization(workerId: string = 'kaggle-gpu-worker') 
     };
   }, [workerId, fetchStatus]);
 
+  // Polling fallback when worker is actively initializing to guarantee synchronization
+  // even if Cloudflare Quick Tunnel or reverse proxies buffer or drop SSE events
+  useEffect(() => {
+    const isActivelyRunning = status && ['checking', 'installing', 'downloading_models', 'validating', 'registering'].includes(status.state);
+    if (!isActivelyRunning) return;
+
+    const pollInterval = setInterval(() => {
+      fetchStatus();
+    }, 1500);
+
+    return () => clearInterval(pollInterval);
+  }, [status?.state, fetchStatus]);
+
   const startInitialization = useCallback(async () => {
     try {
       setLoading(true);

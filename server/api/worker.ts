@@ -32,6 +32,17 @@ router.get('/diagnostic', async (req: Request, res: Response) => {
   }
 });
 
+// GET /api/workers/debug-initialization (Isolated Step-1 execution test)
+router.get('/debug-initialization', async (req: Request, res: Response) => {
+  try {
+    const workerId = (req.query.workerId as string) || 'kaggle-gpu-worker';
+    const result = await workerInitializer.getDebugStep1(workerId);
+    res.json(result);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to run debug initialization' });
+  }
+});
+
 // GET /api/workers/initialization or /api/workers/:id/initialization
 const handleGetInitialization = (req: Request, res: Response) => {
   const workerId = req.params.id || (req.query.workerId as string) || 'kaggle-gpu-worker';
@@ -44,18 +55,31 @@ router.get('/:id/initialization', handleGetInitialization);
 // GET /api/workers/initialization/events or /api/workers/:id/initialization/events (SSE)
 const handleInitializationEvents = (req: Request, res: Response) => {
   const workerId = req.params.id || (req.query.workerId as string) || 'kaggle-gpu-worker';
+  console.log(`[KAGGLE-WORKER][HTTP] SSE client connected (workerId: ${workerId})`);
 
   res.setHeader('Content-Type', 'text/event-stream');
-  res.setHeader('Cache-Control', 'no-cache');
+  res.setHeader('Cache-Control', 'no-cache, no-transform');
   res.setHeader('Connection', 'keep-alive');
+  res.setHeader('X-Accel-Buffering', 'no');
+  res.setHeader('Access-Control-Allow-Origin', '*');
   res.flushHeaders?.();
+  console.log(`[KAGGLE-WORKER][HTTP] SSE HEADERS SENT (workerId: ${workerId})`);
 
-  // Send keepalive comments every 15s to prevent timeouts
+  // Send initial connected event
+  res.write(`event: connected\ndata: ${JSON.stringify({ workerId, time: new Date().toISOString() })}\n\n`);
+
+  // Send keepalive comments every 10s to prevent timeouts through proxies/Cloudflare
   const keepAlive = setInterval(() => {
-    res.write(': keepalive\n\n');
-  }, 15000);
+    try {
+      res.write(': keepalive\n\n');
+      if (typeof (res as any).flush === 'function') {
+        (res as any).flush();
+      }
+    } catch {}
+  }, 10000);
 
   res.on('close', () => {
+    console.log(`[KAGGLE-WORKER][HTTP] SSE client closed (workerId: ${workerId})`);
     clearInterval(keepAlive);
   });
 
@@ -69,17 +93,21 @@ const handleInitializeWorker = async (req: Request, res: Response) => {
   const workerId = req.params.id || req.body?.workerId || 'kaggle-gpu-worker';
   const isRetry = Boolean(req.body?.isRetry || req.query?.retry);
 
+  console.log(`[KAGGLE-WORKER][HTTP] Initialize request RECEIVED (workerId: ${workerId}, isRetry: ${isRetry})`);
+
   try {
     // Start or attach to initialization (non-blocking if long, returns current snapshot immediately, runs in background)
     const statusPromise = workerInitializer.initialize(workerId, isRetry);
     const currentStatus = workerInitializer.getStatus(workerId);
     res.json(currentStatus);
+    console.log(`[KAGGLE-WORKER][HTTP] Initialization response SENT (state: ${currentStatus.state}, progress: ${currentStatus.progress}%)`);
 
     // Keep running in background
     statusPromise.catch((err) => {
       console.error('[WorkerInitializer] Background task error:', err);
     });
   } catch (err: any) {
+    console.error(`[KAGGLE-WORKER][HTTP] Initialize request ERROR:`, err);
     res.status(500).json({ error: err.message || 'Failed to start initialization' });
   }
 };

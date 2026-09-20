@@ -201,9 +201,12 @@ class WorkerInitializerService {
     if (!clients || clients.size === 0) return;
 
     const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
-    for (const client of clients) {
+    for (const client of Array.from(clients)) {
       try {
         client.write(payload);
+        if (typeof (client as any).flush === 'function') {
+          (client as any).flush();
+        }
       } catch {
         clients.delete(client);
       }
@@ -263,19 +266,24 @@ class WorkerInitializerService {
   // Core: Initialize Worker (with lock and safe retry)
   // --------------------------------------------------------------------------
   public async initialize(workerId: string = 'kaggle-gpu-worker', isRetry: boolean = false): Promise<WorkerInitializationStatus> {
+    console.log(`[KAGGLE-WORKER][TRACE] initializeWorker ENTER (workerId: ${workerId}, isRetry: ${isRetry})`);
+    console.log(`[KAGGLE-WORKER][LOCK] acquire START`);
     const status = this.getOrCreateStatus(workerId);
 
     if (status.isLocked) {
+      console.log(`[KAGGLE-WORKER][LOCK] acquire FAILED (already locked)`);
       this.appendLog(workerId, 'Initialization already in progress. Attaching to current session...', 'info');
       return status;
     }
 
     if (status.state === 'ready' && !isRetry) {
+      console.log(`[KAGGLE-WORKER][LOCK] acquire SKIPPED (already ready)`);
       this.appendLog(workerId, 'Worker already initialized and ready in current session ✓', 'info');
       return status;
     }
 
     status.isLocked = true;
+    console.log(`[KAGGLE-WORKER][LOCK] acquire COMPLETE`);
     status.error = null;
     status.state = 'checking';
     this.broadcast(workerId, 'state', { state: status.state, isLocked: true });
@@ -307,6 +315,7 @@ class WorkerInitializerService {
       // Step 1: Detect Python Environment
       currentStepNumber = 1;
       await this.runStep1Environment(workerId, completedSet);
+      console.log(`[KAGGLE-WORKER][TRACE] initializeWorker STEP 1 COMPLETE`);
 
       // Step 2: Detect CUDA & GPU Hardware
       currentStepNumber = 2;
@@ -392,8 +401,10 @@ class WorkerInitializerService {
 
       this.broadcast(workerId, 'error', { error: structuredErr });
     } finally {
+      console.log(`[KAGGLE-WORKER][LOCK] release START`);
       status.isLocked = false;
       this.broadcast(workerId, 'state', { state: status.state, isLocked: false });
+      console.log(`[KAGGLE-WORKER][LOCK] release COMPLETE`);
     }
 
     return status;
@@ -403,6 +414,7 @@ class WorkerInitializerService {
   // Python Binary Discovery (Ensures correct python in Conda/Kaggle/system)
   // --------------------------------------------------------------------------
   public async findPythonBinary(workerId: string = 'kaggle-gpu-worker'): Promise<string> {
+    console.log(`[KAGGLE-WORKER][TRACE] resolvePythonBinary ENTER`);
     const candidates = [
       process.env.PYTHON,
       process.env.PYTHON_BIN,
@@ -415,6 +427,10 @@ class WorkerInitializerService {
     ].filter(Boolean) as string[];
 
     for (const bin of candidates) {
+      const exists = bin.startsWith('/') ? fs.existsSync(bin) : true;
+      console.log(`[KAGGLE-WORKER][PYTHON] testing: ${bin}`);
+      console.log(`[KAGGLE-WORKER][PYTHON] exists: ${exists}`);
+      console.log(`[KAGGLE-WORKER][PYTHON] spawn START`);
       try {
         const res = await this.execCommand(`${bin} --version`, {
           stageName: 'Probe Python',
@@ -423,13 +439,19 @@ class WorkerInitializerService {
           ignoreExitCode: true,
         });
         const out = (res.stdout || res.stderr).trim();
+        console.log(`[KAGGLE-WORKER][PYTHON] spawn COMPLETE`);
+        console.log(`[KAGGLE-WORKER][PYTHON] result: ${out}`);
         if (out.includes('Python 3.')) {
           this.resolvedPythonBin = bin;
+          console.log(`[KAGGLE-WORKER][TRACE] resolvePythonBinary RETURN: ${bin}`);
           return bin;
         }
-      } catch {}
+      } catch (err: any) {
+        console.log(`[KAGGLE-WORKER][PYTHON] spawn FAILED for ${bin}: ${err.message || err}`);
+      }
     }
     this.resolvedPythonBin = 'python3';
+    console.log(`[KAGGLE-WORKER][TRACE] resolvePythonBinary FALLBACK: python3`);
     return 'python3';
   }
 
@@ -439,6 +461,7 @@ class WorkerInitializerService {
   private async runStep1Environment(workerId: string, completedSet: Set<string>) {
     const stepNum = 1;
     const stageName = 'Detecting Python Environment';
+    console.log(`[KAGGLE-WORKER][TRACE] detectPythonEnvironment ENTER`);
     console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     const status = this.getStatus(workerId);
     status.state = 'checking';
@@ -524,6 +547,7 @@ class WorkerInitializerService {
       completedAt: new Date().toISOString(),
     }, 15);
     console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
+    console.log(`[KAGGLE-WORKER][TRACE] detectPythonEnvironment COMPLETE`);
   }
 
   // --------------------------------------------------------------------------
@@ -1228,6 +1252,58 @@ class WorkerInitializerService {
   }
 
   // --------------------------------------------------------------------------
+  // Debug Step 1 Isolation Endpoint Helper
+  // --------------------------------------------------------------------------
+  public async getDebugStep1(workerId: string = 'kaggle-gpu-worker'): Promise<{
+    success: boolean;
+    pythonExecutable: string | null;
+    pythonVersion: string | null;
+    pid: number | null;
+    stdout: string;
+    stderr: string;
+    exitCode: number;
+    durationMs: number;
+    error?: string;
+  }> {
+    const startTime = Date.now();
+    try {
+      const pythonBin = await this.findPythonBinary(workerId);
+      const res = await this.execCommand(`${pythonBin} --version`, {
+        stageName: 'Debug Step 1 (Version)',
+        timeoutMs: 10000,
+        workerId,
+      });
+      const pathRes = await this.execCommand(`${pythonBin} -c "import sys; print(sys.executable)"`, {
+        stageName: 'Debug Step 1 (Path)',
+        timeoutMs: 10000,
+        workerId,
+      });
+      return {
+        success: true,
+        pythonExecutable: pathRes.stdout.trim() || pythonBin,
+        pythonVersion: res.stdout.trim() || res.stderr.trim(),
+        pid: res.pid ?? null,
+        stdout: res.stdout.trim(),
+        stderr: res.stderr.trim(),
+        exitCode: res.exitCode,
+        durationMs: Date.now() - startTime,
+      };
+    } catch (err: any) {
+      return {
+        success: false,
+        pythonExecutable: null,
+        pythonVersion: null,
+        pid: err.pid ?? null,
+        stdout: '',
+        stderr: err.details || '',
+        exitCode: err.exitCode ?? -1,
+        durationMs: Date.now() - startTime,
+        error: err.message || 'Debug Step 1 failed',
+      };
+    }
+  }
+
+  // --------------------------------------------------------------------------
   // Robust Command Execution with Subprocess Spawn, Timeout & Dual Logging
   // --------------------------------------------------------------------------
   public execCommand(cmd: string, options?: ExecCommandOptions): Promise<ExecCommandResult> {
@@ -1236,6 +1312,8 @@ class WorkerInitializerService {
     const startTime = Date.now();
     const sanitizedCmd = this.sanitize(cmd);
     const workerId = options?.workerId || 'kaggle-gpu-worker';
+
+    console.log(`[KAGGLE-WORKER][TRACE] spawnCommand ENTER (stage: "${stageName}", timeout: ${timeoutMs}ms)`);
 
     const enhancedPath = [
       '/opt/conda/bin',
@@ -1262,6 +1340,8 @@ class WorkerInitializerService {
 
     return new Promise((resolve, reject) => {
       let child: ReturnType<typeof spawn>;
+      let hasCompleted = false;
+
       try {
         if (shellBin) {
           child = spawn(shellBin, ['-c', cmd], {
@@ -1277,6 +1357,7 @@ class WorkerInitializerService {
             stdio: ['ignore', 'pipe', 'pipe'],
           });
         }
+        console.log(`[KAGGLE-WORKER][TRACE] child_process.spawn CREATED`);
       } catch (spawnErr: any) {
         const durationMs = Date.now() - startTime;
         console.error(`[KAGGLE-WORKER] [SPAWN ERROR] Stage: "${stageName}" | Error: ${spawnErr.message}`);
@@ -1290,6 +1371,7 @@ class WorkerInitializerService {
       }
 
       const pid = child.pid;
+      console.log(`[KAGGLE-WORKER][TRACE] child PID = ${pid ?? 'N/A'}`);
       console.log(`[KAGGLE-WORKER] Executing: ${sanitizedCmd}`);
       console.log(`[KAGGLE-WORKER] PID: ${pid ?? 'N/A'}`);
 
@@ -1304,6 +1386,7 @@ class WorkerInitializerService {
           stdout = stdout.substring(stdout.length - 15 * 1024 * 1024);
         }
       });
+      console.log(`[KAGGLE-WORKER][TRACE] stdout listener ATTACHED`);
 
       child.stderr?.on('data', (chunk) => {
         const text = chunk.toString();
@@ -1312,6 +1395,7 @@ class WorkerInitializerService {
           stderr = stderr.substring(stderr.length - 15 * 1024 * 1024);
         }
       });
+      console.log(`[KAGGLE-WORKER][TRACE] stderr listener ATTACHED`);
 
       const timer = setTimeout(() => {
         isTimedOut = true;
@@ -1323,9 +1407,14 @@ class WorkerInitializerService {
           }, 1500);
         } catch {}
       }, timeoutMs);
+      console.log(`[KAGGLE-WORKER][TRACE] timeout CREATED (${timeoutMs}ms)`);
 
-      child.on('close', (code, signal) => {
+      const handleDone = (code: number | null, signal: string | null, sourceEvent: string) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
         clearTimeout(timer);
+        console.log(`[KAGGLE-WORKER][TRACE] process ${sourceEvent.toUpperCase()} (code: ${code}, signal: ${signal})`);
+
         const durationMs = Date.now() - startTime;
         const exitCode = isTimedOut ? -1 : (typeof code === 'number' ? code : (signal ? 1 : 0));
         const cleanStdout = stdout.trim();
@@ -1334,6 +1423,7 @@ class WorkerInitializerService {
         console.log(`[KAGGLE-WORKER] stdout: ${this.sanitize(cleanStdout)}`);
         console.log(`[KAGGLE-WORKER] stderr: ${this.sanitize(cleanStderr)}`);
         console.log(`[KAGGLE-WORKER] exitCode: ${exitCode}`);
+        console.log(`[KAGGLE-WORKER][TRACE] spawnCommand RETURN (duration: ${durationMs}ms)`);
 
         if (isTimedOut) {
           const timeoutErr = {
@@ -1370,9 +1460,18 @@ class WorkerInitializerService {
           durationMs,
           pid,
         });
+      };
+
+      child.on('close', (code, signal) => handleDone(code, signal, 'close'));
+      child.on('exit', (code, signal) => {
+        // Fallback exit handler in case close is delayed
+        setTimeout(() => handleDone(code, signal, 'exit'), 100);
       });
+      console.log(`[KAGGLE-WORKER][TRACE] close/exit listeners ATTACHED`);
 
       child.on('error', (err) => {
+        if (hasCompleted) return;
+        hasCompleted = true;
         clearTimeout(timer);
         const durationMs = Date.now() - startTime;
         console.error(`[KAGGLE-WORKER] [PROCESS ERROR] PID: ${pid} Stage: "${stageName}" | Error: ${err.message}`);
