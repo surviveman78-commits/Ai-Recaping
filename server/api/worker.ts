@@ -22,6 +22,16 @@ function verifyWorkerAuth(req: Request, res: Response, next: Function) {
 // Initialization & Capabilities Endpoints
 // -----------------------------------------------------------------------------
 
+router.get('/diagnostic', async (req: Request, res: Response) => {
+  try {
+    const workerId = (req.query.workerId as string) || 'kaggle-gpu-worker';
+    const diag = await workerInitializer.getDiagnostics(workerId);
+    res.json(diag);
+  } catch (err: any) {
+    res.status(500).json({ error: err.message || 'Failed to fetch diagnostics' });
+  }
+});
+
 // GET /api/workers/initialization or /api/workers/:id/initialization
 const handleGetInitialization = (req: Request, res: Response) => {
   const workerId = req.params.id || (req.query.workerId as string) || 'kaggle-gpu-worker';

@@ -282,6 +282,7 @@ export interface WorkerInitStep {
 
 export interface WorkerEnvironmentInfo {
   python?: string;
+  pythonPath?: string;
   pip?: string;
   pytorch?: string;
   cudaAvailable: boolean;

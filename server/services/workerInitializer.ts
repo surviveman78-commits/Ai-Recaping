@@ -1,6 +1,6 @@
 import fs from 'fs';
 import path from 'path';
-import { exec } from 'child_process';
+import { spawn } from 'child_process';
 import { Response } from 'express';
 import {
   WorkerInitStep,
@@ -36,9 +36,12 @@ const INITIAL_STEPS: { id: string; name: string; description: string }[] = [
 
 export interface ExecCommandOptions {
   stageName?: string;
+  stepNumber?: number;
+  totalSteps?: number;
   timeoutMs?: number;
   workerId?: string;
   ignoreExitCode?: boolean;
+  cwd?: string;
 }
 
 export interface ExecCommandResult {
@@ -46,10 +49,25 @@ export interface ExecCommandResult {
   stderr: string;
   exitCode: number;
   durationMs: number;
+  pid?: number;
+}
+
+export interface WorkerDiagnosticInfo {
+  pythonFound: boolean;
+  pythonVersion: string | null;
+  pythonExecutable: string | null;
+  cwd: string;
+  platform: string;
+  nodeVersion: string;
+  bunVersion: string | null;
+  cudaAvailable: boolean;
+  gpu: string | null;
+  timestamp: string;
 }
 
 class WorkerInitializerService {
   public readonly currentSessionId: string = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 9)}`;
+  public resolvedPythonBin: string = 'python3';
   private statusMap: Map<string, WorkerInitializationStatus> = new Map();
   private sseClients: Map<string, Set<Response>> = new Map();
   private heartbeatTimers: Map<string, NodeJS.Timeout> = new Map();
@@ -114,7 +132,6 @@ class WorkerInitializerService {
       if (fs.existsSync(PERSISTENCE_FILE)) {
         const raw = fs.readFileSync(PERSISTENCE_FILE, 'utf-8');
         const data = JSON.parse(raw);
-        // Only restore if valid, matching workerId, and sessionId matches current active session
         if (
           data &&
           data.status === 'ready' &&
@@ -138,7 +155,6 @@ class WorkerInitializerService {
             message: 'Active worker session confirmed from persistent manifest ✓',
           });
 
-          // Register worker in bridge
           workerBridge.registerWorker({
             workerId,
             name: data.name || 'Kaggle GPU Worker',
@@ -172,7 +188,6 @@ class WorkerInitializerService {
     const clients = this.sseClients.get(workerId)!;
     clients.add(res);
 
-    // Initial snapshot sent immediately
     const current = this.getStatus(workerId);
     res.write(`event: snapshot\ndata: ${JSON.stringify(current)}\n\n`);
 
@@ -204,18 +219,8 @@ class WorkerInitializerService {
       message: sanitizedMsg,
     };
     status.logs.push(entry);
-    // Keep max 500 logs in memory
     if (status.logs.length > 500) {
       status.logs.shift();
-    }
-
-    // Explicit output to Kaggle server stdout/stderr so Kaggle notebook visibly displays execution
-    const tag = level === 'error' ? 'ERROR' : level === 'warn' ? 'WARN' : level === 'success' ? 'OK' : 'INFO';
-    const consoleLine = `[KAGGLE-WORKER] [${tag}] ${sanitizedMsg}`;
-    if (level === 'error') {
-      console.error(consoleLine);
-    } else {
-      console.log(consoleLine);
     }
 
     this.broadcast(workerId, 'log', entry);
@@ -260,7 +265,6 @@ class WorkerInitializerService {
   public async initialize(workerId: string = 'kaggle-gpu-worker', isRetry: boolean = false): Promise<WorkerInitializationStatus> {
     const status = this.getOrCreateStatus(workerId);
 
-    // Initialization lock check
     if (status.isLocked) {
       this.appendLog(workerId, 'Initialization already in progress. Attaching to current session...', 'info');
       return status;
@@ -271,7 +275,6 @@ class WorkerInitializerService {
       return status;
     }
 
-    // Acquire lock
     status.isLocked = true;
     status.error = null;
     status.state = 'checking';
@@ -283,7 +286,6 @@ class WorkerInitializerService {
     const completedSet = this.completedStepsCache.get(workerId)!;
 
     if (!isRetry) {
-      // Fresh run: reset logs and steps
       status.logs = [];
       completedSet.clear();
       status.steps.forEach((s) => {
@@ -294,59 +296,75 @@ class WorkerInitializerService {
       status.progress = 0;
     }
 
-    this.appendLog(workerId, `==================================================`, 'info');
+    console.log(`[KAGGLE-WORKER] ==================================================`);
+    console.log(`[KAGGLE-WORKER] ${isRetry ? 'Retrying' : 'Starting'} Kaggle Worker Initialization [${workerId}]`);
+    console.log(`[KAGGLE-WORKER] ==================================================`);
     this.appendLog(workerId, `${isRetry ? 'Retrying' : 'Starting'} Kaggle Worker Initialization [${workerId}]`, 'info');
-    this.appendLog(workerId, `==================================================`, 'info');
+
+    let currentStepNumber = 1;
 
     try {
-      // Step 1: Detect Python Environment (Real execution of python3 --version)
+      // Step 1: Detect Python Environment
+      currentStepNumber = 1;
       await this.runStep1Environment(workerId, completedSet);
 
-      // Step 2: Detect CUDA & GPU Hardware (Real execution of torch.cuda / nvidia-smi)
+      // Step 2: Detect CUDA & GPU Hardware
+      currentStepNumber = 2;
       await this.runStep2CudaGpu(workerId, completedSet);
 
       // Step 3: Check & Install Missing Python Packages
+      currentStepNumber = 3;
       const missingPackages = await this.runStep3CheckDependencies(workerId, completedSet);
       await this.runStep3InstallDependencies(workerId, missingPackages, completedSet);
 
       // Step 4: Check FFmpeg & NVENC Acceleration
+      currentStepNumber = 4;
       await this.runStep4FFmpeg(workerId, completedSet);
 
       // Step 5: Check Existing VoxCPM2 Repository System
+      currentStepNumber = 5;
       await this.runStep5CheckRepoVoxcpm(workerId, completedSet);
 
       // Step 6: Download & Verify Models
+      currentStepNumber = 6;
       const needsModelDownload = await this.runStep6CheckModels(workerId, completedSet);
       await this.runStep6DownloadModels(workerId, needsModelDownload, completedSet);
 
       // Step 7: Load VoxCPM2 into GPU Memory
+      currentStepNumber = 7;
       await this.runStep7LoadVoxcpm(workerId, completedSet);
 
       // Step 8: Validate Whisper ASR & Microsoft Edge TTS
+      currentStepNumber = 8;
       await this.runStep8ValidateWhisperEdgeTts(workerId, completedSet);
 
       // Step 9: Validate Video Timeline Pipeline
+      currentStepNumber = 9;
       await this.runStep9ValidatePipeline(workerId, completedSet);
 
       // Step 10: Run REAL VoxCPM2 Inference Test
+      currentStepNumber = 10;
       await this.runStep10VoxcpmInferenceTest(workerId, completedSet);
 
       // Step 11: Register Worker & Telemetry
+      currentStepNumber = 11;
       await this.runStep11RegisterWorker(workerId, completedSet);
 
       // Step 12: Worker Ready
+      currentStepNumber = 12;
+      console.log(`[KAGGLE-WORKER] Step 12/12 START`);
       this.updateStep(workerId, 11, { status: 'completed', progress: 100, completedAt: new Date().toISOString() }, 100);
       status.state = 'ready';
       status.initializedAt = new Date().toISOString();
+      console.log(`[KAGGLE-WORKER] Step 12/12 COMPLETE`);
+      console.log(`[KAGGLE-WORKER] [OK] Kaggle GPU Worker initialization completed successfully`);
       this.appendLog(workerId, '[OK] Kaggle GPU Worker initialization completed successfully', 'success');
 
-      // Save persistent manifest
       this.persistManifest(workerId);
-
       this.broadcast(workerId, 'complete', { status });
     } catch (err: any) {
       status.state = 'failed';
-      const failedStage = err.stage || status.currentStep || 'Worker Initialization';
+      const failedStage = err.stage || status.currentStep || `Step ${currentStepNumber}/12`;
       const structuredErr: WorkerInitError = {
         code: err.code || 'WORKER_INITIALIZATION_ERROR',
         message: this.sanitize(err.message || 'Worker initialization failed'),
@@ -356,7 +374,6 @@ class WorkerInitializerService {
       };
       status.error = structuredErr;
 
-      // Mark the active step as failed
       const activeStep = status.steps.find((s) => s.name === failedStage || s.status === 'running');
       if (activeStep) {
         activeStep.status = 'failed';
@@ -364,9 +381,14 @@ class WorkerInitializerService {
         this.broadcast(workerId, 'step', activeStep);
       }
 
-      this.appendLog(workerId, `[ERROR] ${failedStage}`, 'error');
+      console.error(`[KAGGLE-WORKER] Step ${currentStepNumber}/12 FAILED`);
+      console.error(`[KAGGLE-WORKER] error: ${structuredErr.message}`);
+      if (err.details) {
+        console.error(`[KAGGLE-WORKER] stderr: ${err.details}`);
+      }
+
+      this.appendLog(workerId, `[ERROR] Step ${currentStepNumber}/12 FAILED: ${failedStage}`, 'error');
       this.appendLog(workerId, structuredErr.message, 'error');
-      console.error(`[KAGGLE-WORKER] [FATAL ERROR] Step '${failedStage}' failed:`, structuredErr.message);
 
       this.broadcast(workerId, 'error', { error: structuredErr });
     } finally {
@@ -378,23 +400,63 @@ class WorkerInitializerService {
   }
 
   // --------------------------------------------------------------------------
+  // Python Binary Discovery (Ensures correct python in Conda/Kaggle/system)
+  // --------------------------------------------------------------------------
+  public async findPythonBinary(workerId: string = 'kaggle-gpu-worker'): Promise<string> {
+    const candidates = [
+      process.env.PYTHON,
+      process.env.PYTHON_BIN,
+      'python3',
+      '/opt/conda/bin/python3',
+      '/opt/conda/bin/python',
+      '/usr/bin/python3',
+      '/usr/bin/python',
+      'python',
+    ].filter(Boolean) as string[];
+
+    for (const bin of candidates) {
+      try {
+        const res = await this.execCommand(`${bin} --version`, {
+          stageName: 'Probe Python',
+          timeoutMs: 6000,
+          workerId,
+          ignoreExitCode: true,
+        });
+        const out = (res.stdout || res.stderr).trim();
+        if (out.includes('Python 3.')) {
+          this.resolvedPythonBin = bin;
+          return bin;
+        }
+      } catch {}
+    }
+    this.resolvedPythonBin = 'python3';
+    return 'python3';
+  }
+
+  // --------------------------------------------------------------------------
   // Step 1: Detect Python Environment
   // --------------------------------------------------------------------------
   private async runStep1Environment(workerId: string, completedSet: Set<string>) {
+    const stepNum = 1;
     const stageName = 'Detecting Python Environment';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     const status = this.getStatus(workerId);
     status.state = 'checking';
     this.updateStep(workerId, 0, { status: 'running', progress: 20, startedAt: new Date().toISOString() }, 8);
-    this.appendLog(workerId, `[START] ${stageName}`);
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     const envInfo: WorkerEnvironmentInfo = {
       cudaAvailable: false,
     };
 
-    // 1. Real execution: python3 --version
+    // 1. Probe and select working Python binary
+    const pythonBin = await this.findPythonBinary(workerId);
+
+    // 2. Real execution: python3 --version
     try {
-      const pyVerResult = await this.execCommand('python3 --version', {
+      const pyVerResult = await this.execCommand(`${pythonBin} --version`, {
         stageName,
+        stepNumber: 1,
         timeoutMs: 15000,
         workerId,
       });
@@ -405,28 +467,32 @@ class WorkerInitializerService {
         code: 'PYTHON_MISSING',
         stage: stageName,
         message: `Python 3 executable not found or failed to execute: ${e.message}`,
+        details: e.details,
       };
     }
 
-    // 2. Real execution: python3 sys.executable path
+    // 3. Real execution: sys.executable
     let pythonPath = '/usr/bin/python3';
     try {
-      const pathRes = await this.execCommand('python3 -c "import sys; print(sys.executable)"', {
+      const pathRes = await this.execCommand(`${pythonBin} -c "import sys; print(sys.executable)"`, {
         stageName: `${stageName} (Path)`,
+        stepNumber: 1,
         timeoutMs: 10000,
         workerId,
       });
       if (pathRes.stdout.trim()) {
         pythonPath = pathRes.stdout.trim();
+        envInfo.pythonPath = pythonPath;
       }
     } catch {}
 
     this.appendLog(workerId, `[OK] Python detected: ${pythonPath} (v${envInfo.python})`, 'success');
 
-    // 3. Real execution: python3 -m pip --version
+    // 4. Real execution: pip --version
     try {
-      const pipResult = await this.execCommand('python3 -m pip --version', {
+      const pipResult = await this.execCommand(`${pythonBin} -m pip --version`, {
         stageName: `${stageName} (Pip)`,
+        stepNumber: 1,
         timeoutMs: 12000,
         workerId,
       });
@@ -438,10 +504,11 @@ class WorkerInitializerService {
       this.appendLog(workerId, '[WARN] pip is not directly installed for python3; fallback system modules will be checked', 'warn');
     }
 
-    // 4. Git check
+    // 5. Git check
     try {
       const gitResult = await this.execCommand('git --version', {
         stageName: `${stageName} (Git)`,
+        stepNumber: 1,
         timeoutMs: 8000,
         workerId,
       });
@@ -456,25 +523,29 @@ class WorkerInitializerService {
       details: `${pythonPath} (v${envInfo.python})`,
       completedAt: new Date().toISOString(),
     }, 15);
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   // --------------------------------------------------------------------------
   // Step 2: Detect CUDA & GPU Hardware
   // --------------------------------------------------------------------------
   private async runStep2CudaGpu(workerId: string, completedSet: Set<string>) {
+    const stepNum = 2;
     const stageName = 'Detecting CUDA & GPU Hardware';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 1, { status: 'running', progress: 30, startedAt: new Date().toISOString() }, 18);
-    this.appendLog(workerId, '[START] Detecting CUDA');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     const status = this.getStatus(workerId);
     const envInfo = status.environment || { cudaAvailable: false };
+    const pyBin = this.resolvedPythonBin;
 
-    // Real PyTorch & CUDA hardware detection script
-    const torchPy = `python3 -c "import torch; print(f'{torch.__version__}|{torch.cuda.is_available()}|{torch.version.cuda or \\'N/A\\'}|{torch.cuda.get_device_name(0) if torch.cuda.is_available() else \\'None\\'}|{int(torch.cuda.get_device_properties(0).total_memory / (1024*1024)) if torch.cuda.is_available() else 0}')"`;
+    const torchPy = `${pyBin} -c "import torch; print(f'{torch.__version__}|{torch.cuda.is_available()}|{torch.version.cuda or \\'N/A\\'}|{torch.cuda.get_device_name(0) if torch.cuda.is_available() else \\'None\\'}|{int(torch.cuda.get_device_properties(0).total_memory / (1024*1024)) if torch.cuda.is_available() else 0}')"`;
 
     try {
       const torchRes = await this.execCommand(torchPy, {
         stageName: `${stageName} (PyTorch CUDA)`,
+        stepNumber: 2,
         timeoutMs: 25000,
         workerId,
       });
@@ -486,15 +557,14 @@ class WorkerInitializerService {
       envInfo.gpuVramMb = parseInt(gVram) || 0;
 
       if (envInfo.cudaAvailable) {
-        this.appendLog(workerId, `[OK] CUDA detected`, 'success');
-        this.appendLog(workerId, '[START] Detecting GPU');
-        this.appendLog(workerId, `[OK] ${envInfo.gpuName || 'GPU'} detected (${envInfo.gpuVramMb} MB VRAM, CUDA ${envInfo.cudaVersion})`, 'success');
+        this.appendLog(workerId, `[OK] CUDA detected (v${envInfo.cudaVersion || 'active'})`, 'success');
+        this.appendLog(workerId, `[OK] ${envInfo.gpuName || 'GPU'} detected (${envInfo.gpuVramMb} MB VRAM)`, 'success');
       } else {
         this.appendLog(workerId, '[INFO] PyTorch CUDA binding is not active; checking nvidia-smi fallback...', 'info');
-        // Fallback: nvidia-smi
         try {
           const smiRes = await this.execCommand('nvidia-smi --query-gpu=name,memory.total --format=csv,noheader,nounits', {
             stageName: `${stageName} (nvidia-smi)`,
+            stepNumber: 2,
             timeoutMs: 12000,
             workerId,
           });
@@ -523,15 +593,18 @@ class WorkerInitializerService {
       details: `${envInfo.gpuName || 'CPU'} (${envInfo.cudaAvailable ? 'CUDA' : 'CPU Mode'})`,
       completedAt: new Date().toISOString(),
     }, 25);
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   // --------------------------------------------------------------------------
   // Step 3: Check & Install Dependencies
   // --------------------------------------------------------------------------
   private async runStep3CheckDependencies(workerId: string, completedSet: Set<string>): Promise<string[]> {
+    const stepNum = 3;
     const stageName = 'Checking Python dependencies';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 2, { status: 'running', progress: 30, startedAt: new Date().toISOString() }, 28);
-    this.appendLog(workerId, `[START] ${stageName}`);
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     if (!fs.existsSync(DEPENDENCIES_FILE)) {
       throw {
@@ -545,12 +618,14 @@ class WorkerInitializerService {
     const packages = manifest.packages || [];
     const missing: string[] = [];
     let satisfied = 0;
+    const pyBin = this.resolvedPythonBin;
 
     for (const pkg of packages) {
       const importName = pkg.importName || pkg.name.replace(/-/g, '_');
       try {
-        await this.execCommand(`python3 -c "import ${importName}"`, {
+        await this.execCommand(`${pyBin} -c "import ${importName}"`, {
           stageName: `Check ${pkg.name}`,
+          stepNumber: 3,
           timeoutMs: 10000,
           workerId,
         });
@@ -572,6 +647,7 @@ class WorkerInitializerService {
   }
 
   private async runStep3InstallDependencies(workerId: string, missingPackages: string[], completedSet: Set<string>) {
+    const stepNum = 3;
     const stageName = 'Installing missing packages';
     if (missingPackages.length === 0) {
       this.updateStep(workerId, 2, {
@@ -581,6 +657,7 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 35);
       completedSet.add('step-3');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
       return;
     }
 
@@ -599,14 +676,16 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 35);
       completedSet.add('step-3');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
       return;
     }
 
-    // Run pip install with a generous timeout of 180s (3 minutes)
-    const cmd = `python3 -m pip install --no-warn-script-location ${missingPackages.join(' ')}`;
+    const pyBin = this.resolvedPythonBin;
+    const cmd = `${pyBin} -m pip install --no-warn-script-location ${missingPackages.join(' ')}`;
     try {
       const installRes = await this.execCommand(cmd, {
         stageName,
+        stepNumber: 3,
         timeoutMs: 180000,
         workerId,
       });
@@ -622,11 +701,13 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 35);
       completedSet.add('step-3');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
     } catch (e: any) {
       throw {
         code: 'PIP_INSTALL_FAILED',
         stage: stageName,
         message: `Failed to install packages (${missingPackages.join(', ')}): ${e.message}`,
+        details: e.details,
       };
     }
   }
@@ -635,13 +716,16 @@ class WorkerInitializerService {
   // Step 4: Checking FFmpeg & NVENC
   // --------------------------------------------------------------------------
   private async runStep4FFmpeg(workerId: string, completedSet: Set<string>) {
+    const stepNum = 4;
     const stageName = 'Checking FFmpeg & NVENC';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 3, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 40);
-    this.appendLog(workerId, '[START] Checking FFmpeg and encoders');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     try {
       const ffmpegRes = await this.execCommand('ffmpeg -version', {
         stageName: `${stageName} (ffmpeg)`,
+        stepNumber: 4,
         timeoutMs: 15000,
         workerId,
       });
@@ -650,15 +734,16 @@ class WorkerInitializerService {
 
       await this.execCommand('ffprobe -version', {
         stageName: `${stageName} (ffprobe)`,
+        stepNumber: 4,
         timeoutMs: 15000,
         workerId,
       });
 
-      // Check nvenc encoder
       let nvenc = false;
       try {
         const encRes = await this.execCommand('ffmpeg -encoders', {
           stageName: `${stageName} (encoders)`,
+          stepNumber: 4,
           timeoutMs: 15000,
           workerId,
         });
@@ -685,6 +770,7 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 48);
       completedSet.add('step-4');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
     } catch {
       throw {
         code: 'FFMPEG_MISSING',
@@ -698,9 +784,11 @@ class WorkerInitializerService {
   // Step 5: Check Repository VoxCPM2 Implementation
   // --------------------------------------------------------------------------
   private async runStep5CheckRepoVoxcpm(workerId: string, completedSet: Set<string>) {
+    const stepNum = 5;
     const stageName = 'Checking Repository VoxCPM2 System';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 4, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 52);
-    this.appendLog(workerId, '[START] Validating repository VoxCPM2 engine');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     const repoEnginePath = path.join(process.cwd(), 'worker', 'tts', 'voxcpm2_engine.py');
     if (!fs.existsSync(repoEnginePath)) {
@@ -711,9 +799,11 @@ class WorkerInitializerService {
       };
     }
 
+    const pyBin = this.resolvedPythonBin;
     try {
-      await this.execCommand(`python3 -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; print('VOXCPM2_REPO_OK')"`, {
+      await this.execCommand(`${pyBin} -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; print('VOXCPM2_REPO_OK')"`, {
         stageName,
+        stepNumber: 5,
         timeoutMs: 25000,
         workerId,
       });
@@ -726,11 +816,13 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 58);
       completedSet.add('step-5');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
     } catch (e: any) {
       throw {
         code: 'VOXCPM2_IMPORT_ERROR',
         stage: stageName,
         message: `Failed to import repository VoxCPM2 engine: ${e.message}`,
+        details: e.details,
       };
     }
   }
@@ -739,9 +831,11 @@ class WorkerInitializerService {
   // Step 6: Checking & Downloading Models
   // --------------------------------------------------------------------------
   private async runStep6CheckModels(workerId: string, completedSet: Set<string>): Promise<boolean> {
+    const stepNum = 6;
     const stageName = 'Downloading & Verifying Models';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 5, { status: 'running', progress: 60, startedAt: new Date().toISOString() }, 62);
-    this.appendLog(workerId, '[START] Verifying VoxCPM2 model cache');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     if (!fs.existsSync(MODELS_DIR)) {
       fs.mkdirSync(MODELS_DIR, { recursive: true });
@@ -764,6 +858,7 @@ class WorkerInitializerService {
   }
 
   private async runStep6DownloadModels(workerId: string, needed: boolean, completedSet: Set<string>) {
+    const stepNum = 6;
     if (!needed && completedSet.has('step-6')) {
       this.updateStep(workerId, 5, {
         status: 'skipped',
@@ -772,6 +867,7 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 68);
       completedSet.add('step-6');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
       return;
     }
 
@@ -799,23 +895,28 @@ class WorkerInitializerService {
       completedAt: new Date().toISOString(),
     }, 68);
     completedSet.add('step-6');
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   // --------------------------------------------------------------------------
   // Step 7: Load VoxCPM2 into GPU Memory
   // --------------------------------------------------------------------------
   private async runStep7LoadVoxcpm(workerId: string, completedSet: Set<string>) {
+    const stepNum = 7;
     const stageName = 'Loading VoxCPM2 into GPU Memory';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     const status = this.getStatus(workerId);
     status.state = 'validating';
     this.updateStep(workerId, 6, { status: 'running', progress: 40, startedAt: new Date().toISOString() }, 72);
-    this.appendLog(workerId, '[START] Loading VoxCPM2 resident weights into GPU memory');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
-    const pyLoad = `python3 -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; engine = VoxCPM2Engine('${MODELS_DIR}'); engine.load_model(); print('VOXCPM2_LOADED_OK')"`;
+    const pyBin = this.resolvedPythonBin;
+    const pyLoad = `${pyBin} -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; engine = VoxCPM2Engine('${MODELS_DIR}'); engine.load_model(); print('VOXCPM2_LOADED_OK')"`;
 
     try {
       const loadRes = await this.execCommand(pyLoad, {
         stageName,
+        stepNumber: 7,
         timeoutMs: 45000,
         workerId,
       });
@@ -836,11 +937,13 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 76);
       completedSet.add('step-7');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
     } catch (e: any) {
       throw {
         code: 'MODEL_LOAD_FAILED',
         stage: stageName,
         message: `Failed to load VoxCPM2 model into GPU memory: ${e.message}`,
+        details: e.details,
       };
     }
   }
@@ -849,14 +952,18 @@ class WorkerInitializerService {
   // Step 8: Validate Whisper ASR & Edge TTS
   // --------------------------------------------------------------------------
   private async runStep8ValidateWhisperEdgeTts(workerId: string, completedSet: Set<string>) {
+    const stepNum = 8;
     const stageName = 'Validating Whisper ASR & Edge TTS';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 7, { status: 'running', progress: 40, startedAt: new Date().toISOString() }, 79);
-    this.appendLog(workerId, '[START] Validating Whisper ASR and Edge TTS');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
-    // Test Whisper / Groq
+    const pyBin = this.resolvedPythonBin;
+
     try {
-      await this.execCommand(`python3 -c "import groq; print('GROQ_OK')"`, {
+      await this.execCommand(`${pyBin} -c "import groq; print('GROQ_OK')"`, {
         stageName: `${stageName} (Groq)`,
+        stepNumber: 8,
         timeoutMs: 15000,
         workerId,
       });
@@ -865,10 +972,10 @@ class WorkerInitializerService {
       this.appendLog(workerId, '[INFO] Whisper transcription client available via standard bindings', 'info');
     }
 
-    // Test Edge TTS
     try {
-      await this.execCommand(`python3 -c "import edge_tts; print('EDGE_TTS_OK')"`, {
+      await this.execCommand(`${pyBin} -c "import edge_tts; print('EDGE_TTS_OK')"`, {
         stageName: `${stageName} (Edge TTS)`,
+        stepNumber: 8,
         timeoutMs: 15000,
         workerId,
       });
@@ -892,15 +999,18 @@ class WorkerInitializerService {
       completedAt: new Date().toISOString(),
     }, 84);
     completedSet.add('step-8');
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   // --------------------------------------------------------------------------
   // Step 9: Validate Video Timeline Pipeline
   // --------------------------------------------------------------------------
   private async runStep9ValidatePipeline(workerId: string, completedSet: Set<string>) {
+    const stepNum = 9;
     const stageName = 'Validating Video Timeline Pipeline';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 8, { status: 'running', progress: 40, startedAt: new Date().toISOString() }, 87);
-    this.appendLog(workerId, '[START] Validating video stream extraction and timeline pipeline');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     const coreFiles = ['audio_extractor.py', 'downloader.py', 'recap_generator.py'];
     for (const f of coreFiles) {
@@ -918,22 +1028,27 @@ class WorkerInitializerService {
       completedAt: new Date().toISOString(),
     }, 90);
     completedSet.add('step-9');
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   // --------------------------------------------------------------------------
   // Step 10: Run REAL VoxCPM2 Inference Test
   // --------------------------------------------------------------------------
   private async runStep10VoxcpmInferenceTest(workerId: string, completedSet: Set<string>) {
+    const stepNum = 10;
     const stageName = 'Running VoxCPM2 Inference Test';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     this.updateStep(workerId, 9, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 93);
-    this.appendLog(workerId, '[START] Running real GPU zero-shot inference test');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
+    const pyBin = this.resolvedPythonBin;
     const testAudioPath = path.join(process.cwd(), 'workspace', 'init_test.wav');
-    const pyInference = `python3 -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; engine = VoxCPM2Engine('${MODELS_DIR}'); dur = engine.synthesize('Testing VoxCPM2 zero-shot inference pipeline.', '', '', 'workspace/init_test.wav', 1.0); print(f'INFERENCE_PASSED|{dur}')"`;
+    const pyInference = `${pyBin} -c "from worker.tts.voxcpm2_engine import VoxCPM2Engine; engine = VoxCPM2Engine('${MODELS_DIR}'); dur = engine.synthesize('Testing VoxCPM2 zero-shot inference pipeline.', '', '', 'workspace/init_test.wav', 1.0); print(f'INFERENCE_PASSED|{dur}')"`;
 
     try {
       const infRes = await this.execCommand(pyInference, {
         stageName,
+        stepNumber: 10,
         timeoutMs: 60000,
         workerId,
       });
@@ -951,11 +1066,13 @@ class WorkerInitializerService {
         completedAt: new Date().toISOString(),
       }, 96);
       completedSet.add('step-10');
+      console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
     } catch (e: any) {
       throw {
         code: 'INFERENCE_TEST_FAILED',
         stage: stageName,
         message: `VoxCPM2 inference test failed: ${e.message}`,
+        details: e.details,
       };
     }
   }
@@ -964,11 +1081,13 @@ class WorkerInitializerService {
   // Step 11: Registering Worker & Starting Heartbeat
   // --------------------------------------------------------------------------
   private async runStep11RegisterWorker(workerId: string, completedSet: Set<string>) {
+    const stepNum = 11;
     const stageName = 'Registering Worker & Telemetry';
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 START`);
     const status = this.getStatus(workerId);
     status.state = 'registering';
     this.updateStep(workerId, 10, { status: 'running', progress: 50, startedAt: new Date().toISOString() }, 98);
-    this.appendLog(workerId, '[START] Registering worker capabilities and telemetry');
+    this.appendLog(workerId, `[START] Step ${stepNum}/12 — ${stageName}`);
 
     const gpuName = status.environment?.gpuName || 'NVIDIA Tesla T4 (Kaggle)';
     const vramMb = status.environment?.gpuVramMb || 16384;
@@ -1004,6 +1123,7 @@ class WorkerInitializerService {
       completedAt: new Date().toISOString(),
     }, 99);
     completedSet.add('step-11');
+    console.log(`[KAGGLE-WORKER] Step ${stepNum}/12 COMPLETE`);
   }
 
   private startHeartbeat(workerId: string, gpuName: string = 'NVIDIA Tesla T4') {
@@ -1045,85 +1165,223 @@ class WorkerInitializerService {
   }
 
   // --------------------------------------------------------------------------
-  // Robust Command Execution with Timeout & Real-time Kaggle Logging
+  // Diagnostic Verification Endpoint Helper
+  // --------------------------------------------------------------------------
+  public async getDiagnostics(workerId: string = 'kaggle-gpu-worker'): Promise<WorkerDiagnosticInfo> {
+    let pythonFound = false;
+    let pythonVersion: string | null = null;
+    let pythonExecutable: string | null = null;
+    let cudaAvailable = false;
+    let gpu: string | null = null;
+
+    try {
+      const bin = await this.findPythonBinary(workerId);
+      const verRes = await this.execCommand(`${bin} --version`, {
+        stageName: 'Diagnostic Version',
+        timeoutMs: 6000,
+        workerId,
+        ignoreExitCode: true,
+      });
+      const out = (verRes.stdout || verRes.stderr).trim();
+      if (out.includes('Python')) {
+        pythonFound = true;
+        pythonVersion = out.replace('Python ', '').trim();
+      }
+
+      const pathRes = await this.execCommand(`${bin} -c "import sys; print(sys.executable)"`, {
+        stageName: 'Diagnostic Path',
+        timeoutMs: 6000,
+        workerId,
+        ignoreExitCode: true,
+      });
+      if (pathRes.stdout.trim()) {
+        pythonExecutable = pathRes.stdout.trim();
+      }
+
+      const torchRes = await this.execCommand(`${bin} -c "import torch; print(f'{torch.cuda.is_available()}|{torch.cuda.get_device_name(0) if torch.cuda.is_available() else \\'None\\'}')"`, {
+        stageName: 'Diagnostic Torch',
+        timeoutMs: 8000,
+        workerId,
+        ignoreExitCode: true,
+      });
+      if (torchRes.stdout.includes('|')) {
+        const [avail, gName] = torchRes.stdout.trim().split('|');
+        cudaAvailable = avail === 'True';
+        gpu = gName !== 'None' ? gName : null;
+      }
+    } catch {}
+
+    const bunVer = typeof (process as any).versions?.bun !== 'undefined' ? (process as any).versions.bun : null;
+
+    return {
+      pythonFound,
+      pythonVersion,
+      pythonExecutable,
+      cwd: process.cwd(),
+      platform: process.platform,
+      nodeVersion: process.version,
+      bunVersion: bunVer,
+      cudaAvailable,
+      gpu,
+      timestamp: new Date().toISOString(),
+    };
+  }
+
+  // --------------------------------------------------------------------------
+  // Robust Command Execution with Subprocess Spawn, Timeout & Dual Logging
   // --------------------------------------------------------------------------
   public execCommand(cmd: string, options?: ExecCommandOptions): Promise<ExecCommandResult> {
     const stageName = options?.stageName || 'Command';
     const timeoutMs = options?.timeoutMs || 30000;
     const startTime = Date.now();
-    const isoStart = new Date().toISOString();
     const sanitizedCmd = this.sanitize(cmd);
+    const workerId = options?.workerId || 'kaggle-gpu-worker';
 
-    console.log(`[KAGGLE-WORKER] [EXEC START] Stage: "${stageName}" | Time: ${isoStart} | Timeout: ${Math.round(timeoutMs / 1000)}s`);
-    console.log(`[KAGGLE-WORKER] > Executing: ${sanitizedCmd}`);
+    const enhancedPath = [
+      '/opt/conda/bin',
+      '/opt/conda/condabin',
+      '/usr/local/nvidia/bin',
+      '/usr/local/cuda/bin',
+      '/usr/local/sbin',
+      '/usr/local/bin',
+      '/usr/sbin',
+      '/usr/bin',
+      '/sbin',
+      '/bin',
+      process.env.PATH || '',
+    ].filter(Boolean).join(':');
+
+    const env = {
+      ...process.env,
+      PATH: enhancedPath,
+      PYTHONUNBUFFERED: '1',
+      DEBIAN_FRONTEND: 'noninteractive',
+    };
+
+    const shellBin = fs.existsSync('/bin/bash') ? '/bin/bash' : (fs.existsSync('/bin/sh') ? '/bin/sh' : undefined);
 
     return new Promise((resolve, reject) => {
-      let isTimedOut = false;
-      const child = exec(cmd, {
-        cwd: process.cwd(),
-        maxBuffer: 15 * 1024 * 1024,
-        timeout: timeoutMs,
-        env: {
-          ...process.env,
-          PYTHONUNBUFFERED: '1',
-          DEBIAN_FRONTEND: 'noninteractive',
-        },
-      }, (err, stdout, stderr) => {
+      let child: ReturnType<typeof spawn>;
+      try {
+        if (shellBin) {
+          child = spawn(shellBin, ['-c', cmd], {
+            cwd: options?.cwd || process.cwd(),
+            env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+        } else {
+          const parts = cmd.split(' ');
+          child = spawn(parts[0], parts.slice(1), {
+            cwd: options?.cwd || process.cwd(),
+            env,
+            stdio: ['ignore', 'pipe', 'pipe'],
+          });
+        }
+      } catch (spawnErr: any) {
         const durationMs = Date.now() - startTime;
-        const isoEnd = new Date().toISOString();
-        const cleanStdout = stdout || '';
-        const cleanStderr = stderr || '';
-        const exitCode = err ? (typeof err.code === 'number' ? err.code : (err.killed ? -1 : 1)) : 0;
+        console.error(`[KAGGLE-WORKER] [SPAWN ERROR] Stage: "${stageName}" | Error: ${spawnErr.message}`);
+        this.appendLog(workerId, `[ERROR] Failed to spawn process: ${spawnErr.message}`, 'error');
+        return reject({
+          code: 'SPAWN_ERROR',
+          stage: stageName,
+          message: spawnErr.message,
+          durationMs,
+        });
+      }
 
-        if (err) {
-          if (err.killed || isTimedOut) {
-            console.error(`[KAGGLE-WORKER] [EXEC TIMEOUT] Stage: "${stageName}" exceeded ${timeoutMs}ms | Start: ${isoStart} | End: ${isoEnd}`);
-            reject({
-              code: 'STAGE_TIMEOUT',
-              stage: stageName,
-              message: `Stage '${stageName}' timed out after ${Math.round(timeoutMs / 1000)}s`,
-              details: `Command exceeded timeout limit of ${timeoutMs}ms`,
-            });
-            return;
-          }
+      const pid = child.pid;
+      console.log(`[KAGGLE-WORKER] Executing: ${sanitizedCmd}`);
+      console.log(`[KAGGLE-WORKER] PID: ${pid ?? 'N/A'}`);
 
-          if (!options?.ignoreExitCode) {
-            console.error(`[KAGGLE-WORKER] [EXEC ERROR] Stage: "${stageName}" | ExitCode: ${exitCode} | Duration: ${durationMs}ms`);
-            if (cleanStdout.trim()) console.log(`[KAGGLE-WORKER] STDOUT:\n${this.sanitize(cleanStdout.trim())}`);
-            if (cleanStderr.trim()) console.error(`[KAGGLE-WORKER] STDERR:\n${this.sanitize(cleanStderr.trim())}`);
+      let stdout = '';
+      let stderr = '';
+      let isTimedOut = false;
 
-            reject({
-              code: 'COMMAND_FAILED',
-              stage: stageName,
-              message: this.sanitize(cleanStderr || cleanStdout || err.message),
-              exitCode,
-              durationMs,
-            });
-            return;
-          }
+      child.stdout?.on('data', (chunk) => {
+        const text = chunk.toString();
+        stdout += text;
+        if (stdout.length > 15 * 1024 * 1024) {
+          stdout = stdout.substring(stdout.length - 15 * 1024 * 1024);
+        }
+      });
+
+      child.stderr?.on('data', (chunk) => {
+        const text = chunk.toString();
+        stderr += text;
+        if (stderr.length > 15 * 1024 * 1024) {
+          stderr = stderr.substring(stderr.length - 15 * 1024 * 1024);
+        }
+      });
+
+      const timer = setTimeout(() => {
+        isTimedOut = true;
+        console.error(`[KAGGLE-WORKER] [EXEC TIMEOUT] PID: ${pid} Stage: "${stageName}" exceeded ${Math.round(timeoutMs / 1000)}s`);
+        try {
+          child.kill('SIGTERM');
+          setTimeout(() => {
+            try { child.kill('SIGKILL'); } catch {}
+          }, 1500);
+        } catch {}
+      }, timeoutMs);
+
+      child.on('close', (code, signal) => {
+        clearTimeout(timer);
+        const durationMs = Date.now() - startTime;
+        const exitCode = isTimedOut ? -1 : (typeof code === 'number' ? code : (signal ? 1 : 0));
+        const cleanStdout = stdout.trim();
+        const cleanStderr = stderr.trim();
+
+        console.log(`[KAGGLE-WORKER] stdout: ${this.sanitize(cleanStdout)}`);
+        console.log(`[KAGGLE-WORKER] stderr: ${this.sanitize(cleanStderr)}`);
+        console.log(`[KAGGLE-WORKER] exitCode: ${exitCode}`);
+
+        if (isTimedOut) {
+          const timeoutErr = {
+            code: 'STAGE_TIMEOUT',
+            stage: stageName,
+            pid,
+            command: sanitizedCmd,
+            message: `Stage '${stageName}' timed out after ${Math.round(timeoutMs / 1000)}s (PID: ${pid})`,
+            details: cleanStderr || `Command timed out: ${sanitizedCmd}`,
+            durationMs,
+          };
+          this.appendLog(workerId, `[ERROR] ${timeoutErr.message}`, 'error');
+          return reject(timeoutErr);
         }
 
-        console.log(`[KAGGLE-WORKER] [EXEC OK] Stage: "${stageName}" | ExitCode: ${exitCode} | Duration: ${durationMs}ms`);
-        if (cleanStdout.trim()) {
-          const firstFewLines = cleanStdout.trim().split('\n').slice(0, 3).join(' ');
-          console.log(`[KAGGLE-WORKER] STDOUT: ${this.sanitize(firstFewLines)}`);
+        if (exitCode !== 0 && !options?.ignoreExitCode) {
+          const failErr = {
+            code: 'COMMAND_FAILED',
+            stage: stageName,
+            pid,
+            command: sanitizedCmd,
+            message: this.sanitize(cleanStderr || cleanStdout || `Command exited with code ${exitCode}`),
+            details: cleanStderr,
+            exitCode,
+            durationMs,
+          };
+          return reject(failErr);
         }
 
         resolve({
-          stdout: cleanStdout,
-          stderr: cleanStderr,
+          stdout,
+          stderr,
           exitCode,
           durationMs,
+          pid,
         });
       });
 
-      child.on('error', (procErr) => {
+      child.on('error', (err) => {
+        clearTimeout(timer);
         const durationMs = Date.now() - startTime;
-        console.error(`[KAGGLE-WORKER] [EXEC SPAWN ERROR] Stage: "${stageName}" | Duration: ${durationMs}ms | Error: ${procErr.message}`);
+        console.error(`[KAGGLE-WORKER] [PROCESS ERROR] PID: ${pid} Stage: "${stageName}" | Error: ${err.message}`);
         reject({
-          code: 'SPAWN_ERROR',
+          code: 'PROCESS_ERROR',
           stage: stageName,
-          message: procErr.message,
+          pid,
+          command: sanitizedCmd,
+          message: err.message,
           durationMs,
         });
       });
