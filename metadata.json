@@ -1,0 +1,6 @@
+{
+  "name": "Movie Recap Studio",
+  "description": "Production-grade movie recap creation studio with Groq Whisper transcription, Gemini narrative rewriting, dynamic TTS timeline reconstruction, and Kaggle GPU worker bridge.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

@@ -1,0 +1,19 @@
+{
+  "workerId": "test-worker-1",
+  "name": "Kaggle GPU Worker",
+  "status": "ready",
+  "initializedAt": "2026-09-20T10:06:25.373Z",
+  "environment": {
+    "cudaAvailable": false,
+    "python": "3.10.12",
+    "git": "git version 2.34.1",
+    "gpuName": "CPU Processing Environment"
+  },
+  "capabilities": {
+    "whisper": true,
+    "edgeTts": true,
+    "voxcpm2": true,
+    "ffmpeg": true,
+    "nvenc": true
+  }
+}

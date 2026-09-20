@@ -1,0 +1,20 @@
+{
+  "model_type": "voxcpm2_zero_shot",
+  "version": "2.0.0",
+  "sample_rate": 24000,
+  "latent_dim": 512,
+  "diffusion_steps": 30,
+  "guidance_scale": 3.5,
+  "supported_languages": [
+    "en",
+    "it",
+    "es",
+    "fr",
+    "de",
+    "my",
+    "ja",
+    "pt",
+    "hi"
+  ],
+  "cachedAt": "2026-09-20T10:06:24.192Z"
+}

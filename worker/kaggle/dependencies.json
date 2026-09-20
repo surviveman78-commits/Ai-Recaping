@@ -1,0 +1,98 @@
+{
+  "python": {
+    "minimum": "3.9"
+  },
+  "packages": [
+    {
+      "name": "torch",
+      "version": ">=2.0.0",
+      "importName": "torch",
+      "required": true,
+      "description": "PyTorch tensor and deep learning engine"
+    },
+    {
+      "name": "torchaudio",
+      "version": ">=2.0.0",
+      "importName": "torchaudio",
+      "required": true,
+      "description": "PyTorch audio processing library"
+    },
+    {
+      "name": "ffmpeg-python",
+      "version": ">=0.2.0",
+      "importName": "ffmpeg",
+      "required": true,
+      "description": "Python FFmpeg bindings for audio/video stream extraction"
+    },
+    {
+      "name": "edge-tts",
+      "version": ">=6.1.12",
+      "importName": "edge_tts",
+      "required": true,
+      "description": "Microsoft Edge high-speed neural TTS synthesizer"
+    },
+    {
+      "name": "groq",
+      "version": ">=0.9.0",
+      "importName": "groq",
+      "required": true,
+      "description": "Groq client for ultra-fast Whisper transcription"
+    },
+    {
+      "name": "google-genai",
+      "version": ">=0.1.1",
+      "importName": "google.genai",
+      "required": true,
+      "description": "Google GenAI SDK for script translation and recap writing"
+    },
+    {
+      "name": "requests",
+      "version": ">=2.31.0",
+      "importName": "requests",
+      "required": true,
+      "description": "HTTP library for server communication and worker heartbeat"
+    },
+    {
+      "name": "yt-dlp",
+      "version": ">=2024.08.06",
+      "importName": "yt_dlp",
+      "required": true,
+      "description": "Video stream extraction and audio downloading engine"
+    },
+    {
+      "name": "pydub",
+      "version": ">=0.25.1",
+      "importName": "pydub",
+      "required": true,
+      "description": "Audio segmentation, crossfades, and normalization"
+    },
+    {
+      "name": "soundfile",
+      "version": ">=0.12.1",
+      "importName": "soundfile",
+      "required": true,
+      "description": "High-fidelity WAV audio file I/O"
+    },
+    {
+      "name": "numpy",
+      "version": ">=1.24.0",
+      "importName": "numpy",
+      "required": true,
+      "description": "Vector mathematics and audio waveform manipulations"
+    },
+    {
+      "name": "scipy",
+      "version": ">=1.11.0",
+      "importName": "scipy",
+      "required": true,
+      "description": "Audio resampling and digital signal processing"
+    },
+    {
+      "name": "tqdm",
+      "version": ">=4.66.0",
+      "importName": "tqdm",
+      "required": true,
+      "description": "Progress tracking instrumentation"
+    }
+  ]
+}
