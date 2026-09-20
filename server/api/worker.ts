@@ -245,7 +245,7 @@ router.post('/jobs/:id/progress', verifyWorkerAuth, (req: Request, res: Response
 // POST /api/worker/jobs/:id/complete - Mark job completed
 router.post('/jobs/:id/complete', verifyWorkerAuth, (req: Request, res: Response) => {
   const jobId = req.params.id;
-  const { outputVideoPath, outputVideoUrl, segments, recapSegments, originalTranscript, translatedScript, metrics } = req.body;
+  const { outputVideoPath, outputVideoUrl, segments, recapSegments, originalTranscript, translatedScript, metrics, srtPath } = req.body;
 
   const job = jobStore.getJob(jobId);
   if (!job) {
@@ -260,13 +260,16 @@ router.post('/jobs/:id/complete', verifyWorkerAuth, (req: Request, res: Response
     }
   }
 
+  const finalVideoUrl = outputVideoUrl || `/api/jobs/${jobId}/video`;
+
   const updated = jobStore.updateJob(jobId, {
     status: 'completed',
     currentStage: 'Completed',
     currentStageNumber: 10,
     progress: 100,
     outputVideoPath: outputVideoPath || job.outputVideoPath,
-    outputVideoUrl: outputVideoUrl || job.outputVideoUrl || 'https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/TearsOfSteel.mp4',
+    outputVideoUrl: finalVideoUrl,
+    srtPath: srtPath || job.srtPath,
     segments: segments || job.segments,
     recapSegments: recapSegments || job.recapSegments,
     originalTranscript: originalTranscript || job.originalTranscript,

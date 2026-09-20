@@ -116,6 +116,30 @@ class JobWorkspace:
     def subtitles_manifest_path(self) -> str:
         return os.path.join(self.subtitles_dir, "manifest.json")
 
+    @property
+    def subtitles_ass_path(self) -> str:
+        return os.path.join(self.subtitles_dir, "recap.ass")
+
+    @property
+    def tts_track_audio_path(self) -> str:
+        return os.path.join(self.audio_dir, "tts_track.wav")
+
+    @property
+    def mixed_audio_path(self) -> str:
+        return os.path.join(self.audio_dir, "mixed_audio.wav")
+
+    @property
+    def reconstructed_video_path(self) -> str:
+        return os.path.join(self.timeline_dir, "reconstructed_video.mp4")
+
+    @property
+    def output_video_path(self) -> str:
+        return os.path.join(self.output_dir, "final_recap.mp4")
+
+    @property
+    def output_manifest_path(self) -> str:
+        return os.path.join(self.output_dir, "manifest.json")
+
     def save_json(self, file_path: str, data: Any):
         """Safely write JSON data with atomic formatting."""
         self._assert_path_inside_job(file_path)

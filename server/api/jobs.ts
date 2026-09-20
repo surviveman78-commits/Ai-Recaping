@@ -109,12 +109,6 @@ router.post('/', (req: Request, res: Response) => {
     // Trigger queue processing for online workers
     workerBridge.triggerQueueProcessing();
 
-    // If autoSimulate is true or worker is not currently online, start pipeline runner
-    const workerStatus = workerBridge.getStatus();
-    if (autoSimulate || !workerStatus.isOnline) {
-      workerBridge.runSimulation(job.id);
-    }
-
     res.status(201).json(job);
   } catch (err: any) {
     res.status(500).json({ error: err.message || 'Failed to create job' });
@@ -180,19 +174,19 @@ router.post('/:id/retry', (req: Request, res: Response) => {
     res.status(404).json({ error: 'Job not found' });
     return;
   }
-  workerBridge.runSimulation(retried.id);
+  workerBridge.triggerQueueProcessing();
   res.json(retried);
 });
 
-// POST /api/jobs/:id/simulate - Trigger test simulation for this job
+// POST /api/jobs/:id/simulate - Trigger queue processing for this job
 router.post('/:id/simulate', (req: Request, res: Response) => {
   const job = jobStore.getJob(req.params.id);
   if (!job) {
     res.status(404).json({ error: 'Job not found' });
     return;
   }
-  workerBridge.runSimulation(job.id);
-  res.json({ message: 'Simulation started', jobId: job.id });
+  workerBridge.triggerQueueProcessing();
+  res.json({ message: 'Queue processing triggered', jobId: job.id });
 });
 
 // GET /api/jobs/:id/events - SSE stream for specific job
@@ -283,6 +277,67 @@ router.get('/:id/subtitles', (req: Request, res: Response) => {
   res.setHeader('Content-Type', 'text/plain; charset=utf-8');
   res.setHeader('Content-Disposition', `attachment; filename="${job.title ? job.title.replace(/[^a-zA-Z0-9_-]/g, '_') : 'recap'}.srt"`);
   res.send(srt);
+});
+
+// GET /api/jobs/:id/video - Stream real deliverable final_recap.mp4
+router.get('/:id/video', (req: Request, res: Response) => {
+  const jobId = req.params.id;
+  const job = jobStore.getJob(jobId);
+  if (!job) {
+    res.status(404).json({ error: 'Job not found' });
+    return;
+  }
+
+  const fs = require('fs');
+  const path = require('path');
+  
+  // Potential physical paths for final video
+  const candidates = [
+    job.outputVideoPath,
+    path.join(process.cwd(), 'workspace', 'jobs', jobId, 'output', 'final_recap.mp4'),
+    path.join(process.cwd(), 'workspace', 'jobs', jobId, 'outputs', 'final_recap.mp4'),
+  ].filter(Boolean);
+
+  let realVideoPath: string | null = null;
+  for (const cp of candidates) {
+    if (cp && fs.existsSync(cp) && fs.statSync(cp).size > 0) {
+      realVideoPath = cp;
+      break;
+    }
+  }
+
+  if (!realVideoPath) {
+    res.status(404).json({ error: 'Final recap video file not found on disk for this job' });
+    return;
+  }
+
+  const stat = fs.statSync(realVideoPath);
+  const fileSize = stat.size;
+  const range = req.headers.range;
+
+  if (range) {
+    const parts = range.replace(/bytes=/, '').split('-');
+    const start = parseInt(parts[0], 10);
+    const end = parts[1] ? parseInt(parts[1], 10) : fileSize - 1;
+    const chunksize = (end - start) + 1;
+    const file = fs.createReadStream(realVideoPath, { start, end });
+    const head = {
+      'Content-Range': `bytes ${start}-${end}/${fileSize}`,
+      'Accept-Ranges': 'bytes',
+      'Content-Length': chunksize,
+      'Content-Type': 'video/mp4',
+    };
+    res.writeHead(206, head);
+    file.pipe(res);
+  } else {
+    const head = {
+      'Content-Length': fileSize,
+      'Content-Type': 'video/mp4',
+      'Accept-Ranges': 'bytes',
+    };
+    res.writeHead(200, head);
+    fs.createReadStream(realVideoPath).pipe(res);
+  }
 });
 
 // GET /api/jobs/:id/timeline - Get authoritative timeline metadata

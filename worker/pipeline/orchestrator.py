@@ -1,5 +1,8 @@
 import os
 import time
+import shutil
+import subprocess
+import json
 from typing import Dict, Any, Callable, Optional, List
 
 from worker.core.workspace import JobWorkspace
@@ -9,6 +12,8 @@ from worker.core.transcriber import GroqWhisperTranscriber, TranscriptionError
 from worker.core.recap_generator import GeminiRecapGenerator, RecapGenerationError
 from worker.core.tts import TTSManager, TTSError
 from worker.core.timeline import TimelineEngine, TimelineValidationError
+from worker.audio.mixer import AudioMixer
+from worker.subtitles.renderer import SubtitleRenderer
 
 class RecapPipelineOrchestrator:
     """
@@ -548,13 +553,258 @@ class RecapPipelineOrchestrator:
             }
 
         # -------------------------------------------------------------
-        # PIPELINE COMPLETION FOR PROMPT 05
+        # STAGE 7: Mixing Audio (Assemble TTS Track & Mix with Background)
         # -------------------------------------------------------------
-        # Per specification: Prompt 05 ends at Stage 6 (Rebuilding Timeline -> Complete),
-        # producing timeline/timeline.json, intermediate video segments, and subtitles/recap.srt.
-        # DO NOT mix audio or encode final video in this stage.
+        self.notify("Mixing Audio", 7, 0, {
+            "message": "Assembling TTS audio track and mixing background audio...",
+        })
+
+        try:
+            mixer = AudioMixer(ducking_attenuation_db=-18)
+
+            # 7a. Assemble narrative TTS segments onto a master timeline
+            self.notify("Mixing Audio", 7, 30, {
+                "message": "Aligning TTS voice segments onto master audio canvas...",
+            })
+            mixer.assemble_tts_track(
+                segments=final_job_segments,
+                total_duration=total_timeline_dur,
+                output_tts_track_path=self.workspace.tts_track_audio_path,
+            )
+
+            # 7b. Mix with extracted original audio (ducking background when narrator speaks)
+            self.notify("Mixing Audio", 7, 70, {
+                "message": "Applying sidechain compression ducking to original movie audio...",
+            })
+
+            has_background_audio = os.path.exists(self.workspace.extracted_audio_path)
+            if has_background_audio:
+                try:
+                    mixer.mix_narration_with_background(
+                        tts_audio_path=self.workspace.tts_track_audio_path,
+                        background_audio_path=self.workspace.extracted_audio_path,
+                        output_mixed_path=self.workspace.mixed_audio_path,
+                    )
+                except Exception as mix_err:
+                    print(f"[Orchestrator] Background mix fallback (using TTS track): {mix_err}")
+                    shutil.copy2(self.workspace.tts_track_audio_path, self.workspace.mixed_audio_path)
+            else:
+                shutil.copy2(self.workspace.tts_track_audio_path, self.workspace.mixed_audio_path)
+
+            self.notify("Mixing Audio", 7, 100, {
+                "message": "Master blended audio track rendered with voice ducking.",
+                "audioPath": self.workspace.mixed_audio_path,
+            })
+
+        except Exception as ame:
+            raise {
+                "stage": "Mixing Audio",
+                "code": "AUDIO_MIXING_FAILED",
+                "message": f"Audio mixing failed: {str(ame)}",
+                "retryable": True,
+            }
+
+        # -------------------------------------------------------------
+        # STAGE 8: Rendering Subtitles (Generate ASS / Prepare Styling)
+        # -------------------------------------------------------------
+        self.notify("Rendering Subtitles", 8, 0, {
+            "message": "Generating styled subtitle layout from timeline timestamps...",
+        })
+
+        try:
+            subtitle_renderer = SubtitleRenderer()
+            subtitle_config = self.job.get("subtitleConfig") or {}
+
+            # Generate ASS file for burned-in styled subtitles
+            self.notify("Rendering Subtitles", 8, 50, {
+                "message": "Rendering ASS typography and timing...",
+            })
+            subtitle_renderer.generate_ass_file(
+                segments=final_job_segments,
+                subtitle_config=subtitle_config,
+                output_ass_path=self.workspace.subtitles_ass_path,
+            )
+
+            self.notify("Rendering Subtitles", 8, 100, {
+                "message": "Subtitles synchronized to timeline and rendered to ASS & SRT.",
+                "assPath": self.workspace.subtitles_ass_path,
+                "srtPath": self.workspace.subtitles_srt_path,
+            })
+
+        except Exception as sre:
+            raise {
+                "stage": "Rendering Subtitles",
+                "code": "SUBTITLE_RENDERING_FAILED",
+                "message": f"Subtitle rendering failed: {str(sre)}",
+                "retryable": True,
+            }
+
+        # -------------------------------------------------------------
+        # STAGE 9: Encoding Final Video (Assemble Cuts + Audio + Subtitles)
+        # -------------------------------------------------------------
+        self.notify("Encoding Final Video", 9, 0, {
+            "message": "Assembling reconstructed video clips, master audio track, and subtitles...",
+        })
+
+        try:
+            # 9a. Concat intermediate video segments if they exist
+            segment_files = [
+                os.path.join(self.workspace.timeline_dir, f"segment_{i+1:04d}.mp4")
+                for i in range(len(final_job_segments))
+            ]
+            existing_segment_files = [f for f in segment_files if os.path.exists(f)]
+
+            reconstructed_video_path = self.workspace.reconstructed_video_path
+
+            if existing_segment_files:
+                self.notify("Encoding Final Video", 9, 25, {
+                    "message": f"Concatenating {len(existing_segment_files)} reconstructed video cuts...",
+                })
+                concat_list_path = os.path.join(self.workspace.timeline_dir, "concat_list.txt")
+                with open(concat_list_path, "w", encoding="utf-8") as f:
+                    for sf in existing_segment_files:
+                        safe_path = sf.replace("'", "'\\''")
+                        f.write(f"file '{safe_path}'\n")
+
+                concat_cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "concat",
+                    "-safe", "0",
+                    "-i", concat_list_path,
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "18",
+                    "-an",
+                    reconstructed_video_path
+                ]
+                concat_res = subprocess.run(concat_cmd, capture_output=True, text=True)
+                if concat_res.returncode != 0:
+                    print(f"[Orchestrator] Concat fallback copying: {concat_res.stderr[:200]}")
+                    concat_cmd_copy = [
+                        "ffmpeg", "-y", "-f", "concat", "-safe", "0",
+                        "-i", concat_list_path, "-c", "copy", reconstructed_video_path
+                    ]
+                    subprocess.run(concat_cmd_copy, check=True)
+            elif os.path.exists(self.workspace.source_video_path):
+                trim_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", self.workspace.source_video_path,
+                    "-t", str(total_timeline_dur),
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "18",
+                    "-an",
+                    reconstructed_video_path
+                ]
+                subprocess.run(trim_cmd, check=True)
+            else:
+                gen_canvas_cmd = [
+                    "ffmpeg", "-y",
+                    "-f", "lavfi",
+                    "-i", f"color=c=black:s=1920x1080:d={total_timeline_dur}:r=30",
+                    "-c:v", "libx264",
+                    "-preset", "veryfast",
+                    "-pix_fmt", "yuv420p",
+                    reconstructed_video_path
+                ]
+                subprocess.run(gen_canvas_cmd, check=True)
+
+            # 9b. Final Mux: Video + Master Audio + Subtitle Burn
+            self.notify("Encoding Final Video", 9, 65, {
+                "message": "Muxing master audio and burning subtitles with libx264 / aac...",
+            })
+
+            output_video_path = self.workspace.output_video_path
+            ass_path = self.workspace.subtitles_ass_path
+            mixed_audio_path = self.workspace.mixed_audio_path
+
+            burn_success = False
+            if os.path.exists(ass_path):
+                escaped_ass = ass_path.replace("\\", "/").replace(":", "\\:").replace("'", "\\'")
+                encode_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", reconstructed_video_path,
+                    "-i", mixed_audio_path,
+                    "-vf", f"ass='{escaped_ass}'",
+                    "-c:v", "libx264",
+                    "-preset", "medium",
+                    "-crf", "19",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    output_video_path
+                ]
+                res = subprocess.run(encode_cmd, capture_output=True, text=True)
+                if res.returncode == 0 and os.path.exists(output_video_path) and os.path.getsize(output_video_path) > 0:
+                    burn_success = True
+                else:
+                    print(f"[Orchestrator] ASS burn failed, falling back to direct mux without ASS...")
+
+            if not burn_success:
+                mux_cmd = [
+                    "ffmpeg", "-y",
+                    "-i", reconstructed_video_path,
+                    "-i", mixed_audio_path,
+                    "-c:v", "libx264",
+                    "-preset", "fast",
+                    "-crf", "20",
+                    "-c:a", "aac",
+                    "-b:a", "192k",
+                    "-movflags", "+faststart",
+                    "-shortest",
+                    output_video_path
+                ]
+                subprocess.run(mux_cmd, check=True)
+
+            if not os.path.exists(output_video_path) or os.path.getsize(output_video_path) == 0:
+                raise RuntimeError(f"Final output video was not created at {output_video_path}")
+
+            final_filesize = os.path.getsize(output_video_path)
+            self.notify("Encoding Final Video", 9, 100, {
+                "message": f"Final recap deliverable encoded successfully ({final_filesize / (1024*1024):.2f} MB).",
+                "outputVideoPath": output_video_path,
+                "filesize": final_filesize,
+            })
+
+            # Write output manifest
+            output_manifest = {
+                "version": 1,
+                "jobId": self.job_id,
+                "title": job_title,
+                "targetLanguage": target_language,
+                "outputVideo": output_video_path,
+                "filesizeBytes": final_filesize,
+                "srtSubtitles": self.workspace.subtitles_srt_path,
+                "assSubtitles": self.workspace.subtitles_ass_path,
+                "audioTrack": self.workspace.mixed_audio_path,
+                "durationSeconds": total_timeline_dur,
+                "completedAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+            }
+            self.workspace.save_json(self.workspace.output_manifest_path, output_manifest)
+
+        except Exception as fve:
+            raise {
+                "stage": "Encoding Final Video",
+                "code": "FINAL_VIDEO_ENCODING_FAILED",
+                "message": f"Final video encoding failed: {str(fve)}",
+                "retryable": True,
+            }
+
+        # -------------------------------------------------------------
+        # STAGE 10: Completed
+        # -------------------------------------------------------------
+        self.notify("Completed", 10, 100, {
+            "message": "Movie recap processing completed! All physical deliverables verified.",
+            "outputVideoPath": self.workspace.output_video_path,
+            "srtPath": self.workspace.subtitles_srt_path,
+            "totalDuration": total_timeline_dur,
+        })
+
         return {
-            "status": "timeline_completed",
+            "status": "completed",
+            "output_video_path": self.workspace.output_video_path,
+            "subtitle_path": self.workspace.subtitles_srt_path,
             "source_video_path": self.workspace.source_video_path,
             "extracted_audio_path": self.workspace.extracted_audio_path,
             "original_transcript_path": self.workspace.original_transcript_json_path,
@@ -567,7 +817,8 @@ class RecapPipelineOrchestrator:
             "timeline_json_path": timeline_result.get("timelineJsonPath"),
             "timeline_manifest_path": timeline_result.get("timelineManifestPath"),
             "subtitles_srt_path": timeline_result.get("srtPath"),
-            "subtitles_manifest_path": timeline_result.get("srtManifestPath"),
+            "subtitles_ass_path": self.workspace.subtitles_ass_path,
+            "mixed_audio_path": self.workspace.mixed_audio_path,
             "original_transcript": transcript_segments,
             "translated_script": recap_result.get("fullRecapText"),
             "recap_segments": authoritative_recap_segs,

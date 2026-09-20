@@ -179,12 +179,30 @@ class KaggleGpuWorker:
             )
             result = orchestrator.run()
 
-            print(f"[Worker] Job {job_id} finished successfully!")
+            out_vid = result.get("output_video_path")
+            sub_path = result.get("subtitle_path")
+
+            # Verify physical file existence and non-zero size before reporting completion
+            if not out_vid or not os.path.exists(out_vid) or os.path.getsize(out_vid) == 0:
+                raise RuntimeError(f"Output video file missing or empty: {out_vid}")
+            if not sub_path or not os.path.exists(sub_path) or os.path.getsize(sub_path) == 0:
+                raise RuntimeError(f"Subtitle file missing or empty: {sub_path}")
+
+            print(f"[Worker] Job {job_id} finished successfully! (Output: {out_vid}, {os.path.getsize(out_vid)} bytes)")
             requests.post(
                 f"{self.server_url}/api/worker/jobs/{job_id}/complete",
                 json={
-                    "outputVideoPath": result.get("output_video_path"),
+                    "outputVideoPath": out_vid,
+                    "subtitlePath": sub_path,
                     "segments": result.get("segments"),
+                    "recapSegments": result.get("recap_segments"),
+                    "originalTranscript": result.get("original_transcript"),
+                    "translatedScript": result.get("translated_script"),
+                    "metrics": {
+                        "totalTtsDuration": result.get("total_tts_duration"),
+                        "totalTimelineDuration": result.get("total_timeline_duration"),
+                        "filesize": os.path.getsize(out_vid),
+                    }
                 },
                 headers=self._headers(),
                 timeout=10,
